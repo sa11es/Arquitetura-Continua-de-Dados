@@ -50,7 +50,7 @@ services:
 
   # 4. Debezium CDC
   debezium:
-    image: confluentinc/cp-kafka-connect:7.5.0
+    image: quay.io/debezium/connect:2.4
     container_name: debezium-connect
     depends_on:
       - kafka
@@ -58,21 +58,16 @@ services:
     ports:
       - "8083:8083"
     environment:
-      CONNECT_BOOTSTRAP_SERVERS: "kafka:29092"
-      CONNECT_REST_PORT: 8083
-      CONNECT_GROUP_ID: compose-connect-group
-      CONNECT_CONFIG_STORAGE_TOPIC: docker-connect-configs
-      CONNECT_OFFSET_STORAGE_TOPIC: docker-connect-offsets
-      CONNECT_STATUS_STORAGE_TOPIC: docker-connect-status
-      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
-      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
-      CONNECT_INTERNAL_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
-      CONNECT_INTERNAL_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
-      CONNECT_REST_ADVERTISED_HOST_NAME: debezium-connect
-      CONNECT_PLUGIN_PATH: "/usr/share/java,/usr/share/confluent-hub-components"
-      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: "1"
-      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: "1"
-      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: "1"
+      BOOTSTRAP_SERVERS: "kafka:29092"
+      GROUP_ID: "compose-connect-group"
+      CONFIG_STORAGE_TOPIC: "docker-connect-configs"
+      OFFSET_STORAGE_TOPIC: "docker-connect-offsets"
+      STATUS_STORAGE_TOPIC: "docker-connect-status"
+      KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      INTERNAL_KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      INTERNAL_VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      REST_ADVERTISED_HOST_NAME: "debezium-connect"
 
   # 5. Apache Flink
   flink-jobmanager:
