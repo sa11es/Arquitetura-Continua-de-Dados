@@ -4,7 +4,11 @@ CREATE TABLE notificacoes_dengue (
     dt_sintomas DATE NOT NULL,
     municipio_residencia VARCHAR(100) NOT NULL,
     codigo_ibge VARCHAR(7) NOT NULL,
-    cid_10 VARCHAR(4) NOT NULL, 
+    bairro VARCHAR(100) NOT NULL,
+    doenca VARCHAR(20) NOT NULL CHECK (
+        doenca IN ('POPULAR', 'DENGUE', 'MENINGITE', 'INFLUENZA')
+    ),
+    cid_10 VARCHAR(10) NOT NULL,
     idade INT NOT NULL,
     sexo CHAR(1) CHECK (sexo IN ('M', 'F', 'I')),
     status_caso VARCHAR(20) DEFAULT 'SUSPEITO',
