@@ -1,7 +1,7 @@
 version: "3.8"
 
 services:
-  # 1. Banco de Dados Legado (PostgreSQL com WAL habilitado)
+  # 1. Banco de Dados Legado (Ponta Grossa) (PostgreSQL com WAL habilitado)
   postgres-legado:
     image: postgres:15
     container_name: postgres-legado
@@ -13,6 +13,50 @@ services:
       - "5433:5432"
     volumes:
       # Mapeia o script SQL para ser executado na inicializacao
+      - ../database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sinan_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+      # 1.2 Banco de Curitiba
+  postgres-curitiba:
+    image: postgres:15
+    container_name: postgres-curitiba
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgrespassword
+      POSTGRES_DB: sinan_db
+    ports:
+      - "5434:5432"
+    volumes:
+      - ../database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sinan_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # 1.3 Banco de Castro
+  postgres-castro:
+    image: postgres:15
+    container_name: postgres-castro
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgrespassword
+      POSTGRES_DB: sinan_db
+    ports:
+      - "5435:5432"
+    volumes:
       - ../database/init.sql:/docker-entrypoint-initdb.d/init.sql
     command:
       - "postgres"
