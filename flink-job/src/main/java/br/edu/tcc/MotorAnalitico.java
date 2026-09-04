@@ -7,7 +7,6 @@ import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.functions.FlatMapFunction;
 import org.apache.flink.api.common.serialization.SimpleStringSchema;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
-import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.connector.base.DeliveryGuarantee;
 import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema;
 import org.apache.flink.connector.kafka.sink.KafkaSink;
@@ -26,8 +25,11 @@ import java.io.Serializable;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.Month;
+import java.time.format.DateTimeFormatter;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.time.Duration;
 
 public class MotorAnalitico {
@@ -113,8 +115,7 @@ public class MotorAnalitico {
         public String cid10;
         public int mes;
 
-        public Notificacao() {
-        }
+        public Notificacao() {}
 
         public Notificacao(
                 long timestamp,
@@ -141,8 +142,7 @@ public class MotorAnalitico {
         public String tipo;
         public Notificacao notificacao;
 
-        public RegistroAlerta() {
-        }
+        public RegistroAlerta() {}
 
         public RegistroAlerta(
                 String chave,
@@ -268,50 +268,87 @@ public class MotorAnalitico {
         }
     }
 
+    // === AVALIADOR DE REGRAS COM SAÍDA JSON ===
     public static class AvaliarRegra
             extends ProcessWindowFunction<
                     RegistroAlerta,
                     String,
                     String,
-                    TimeWindow
-                    > {
+                    TimeWindow> {
+
+        private transient ObjectMapper mapper;
+
+        private static final DateTimeFormatter FMT_JANELA =
+                DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm")
+                        .withZone(ZoneId.of("America/Sao_Paulo"));
+
         @Override
         public void process(
                 String chave,
                 Context contexto,
                 Iterable<RegistroAlerta> eventos,
                 Collector<String> out
-        ) {
+        ) throws Exception {
+            if (mapper == null) {
+                mapper = new ObjectMapper();
+            }
+
             int quantidade = 0;
             String doenca = "";
             String municipio = "";
+            String codigoIbge = "";
             String bairro = "";
             int mes = 1;
+
             for (RegistroAlerta evento : eventos) {
                 quantidade++;
                 doenca = evento.notificacao.doenca;
                 municipio = evento.notificacao.municipio;
+                codigoIbge = evento.notificacao.codigoIbge;
                 bairro = evento.notificacao.bairro;
                 mes = evento.notificacao.mes;
             }
-            int limiar = obterLimiar(doenca, eventoTipo(chave), mes);
+
+            String tipo = eventoTipo(chave);
+            int limiar = obterLimiar(doenca, tipo, mes);
+
             if (quantidade >= limiar) {
-                out.collect(
-                        String.format(
-                                "ALERTA | doença=%s | município=%s"
-                                        + " | bairro=%s | quantidade=%d"
-                                        + " | limiar=%d | janela_inicio=%s"
-                                        + " | janela_fim=%s | chave=%s",
-                                doenca,
-                                municipio,
-                                bairro.isEmpty() ? "TODOS" : bairro,
-                                quantidade,
-                                limiar,
-                                contexto.window().getStart(),
-                                contexto.window().getEnd(),
-                                chave
-                        )
-                );
+                // Descrição legível da regra violada
+                String regra = limiar + " casos em 24h por "
+                        + ("BAIRRO".equals(tipo) ? "bairro" : "município");
+
+                // Cálculo de gravidade
+                String gravidade;
+                if (quantidade >= limiar * 2) {
+                    gravidade = "CRITICA";
+                } else if (quantidade >= (int) Math.ceil(limiar * 1.5)) {
+                    gravidade = "ALTA";
+                } else {
+                    gravidade = "MODERADA";
+                }
+
+                // Formata janela temporal em data legível
+                String janelaInicio = FMT_JANELA.format(
+                        Instant.ofEpochMilli(contexto.window().getStart()));
+                String janelaFim = FMT_JANELA.format(
+                        Instant.ofEpochMilli(contexto.window().getEnd()));
+
+                // Monta JSON do alerta
+                Map<String, Object> alerta = new HashMap<>();
+                alerta.put("doenca", doenca);
+                alerta.put("municipio", municipio);
+                alerta.put("codigo_ibge", codigoIbge);
+                alerta.put("bairro", bairro.isEmpty() ? "TODOS" : bairro);
+                alerta.put("regra_violada", regra);
+                alerta.put("tipo_agregacao", tipo);
+                alerta.put("quantidade", quantidade);
+                alerta.put("limiar", limiar);
+                alerta.put("gravidade", gravidade);
+                alerta.put("janela_inicio", janelaInicio);
+                alerta.put("janela_fim", janelaFim);
+                alerta.put("chave", chave);
+
+                out.collect(mapper.writeValueAsString(alerta));
             }
         }
 
