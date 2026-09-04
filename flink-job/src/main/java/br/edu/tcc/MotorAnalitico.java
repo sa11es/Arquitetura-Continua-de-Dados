@@ -2,13 +2,15 @@ package br.edu.tcc;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-
 import org.apache.flink.api.common.eventtime.SerializableTimestampAssigner;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.functions.FlatMapFunction;
 import org.apache.flink.api.common.serialization.SimpleStringSchema;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.connector.base.DeliveryGuarantee;
+import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema;
+import org.apache.flink.connector.kafka.sink.KafkaSink;
 import org.apache.flink.connector.kafka.source.KafkaSource;
 import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
 import org.apache.flink.streaming.api.datastream.DataStream;
@@ -35,14 +37,12 @@ public class MotorAnalitico {
             "epidemiologia_curitiba.public.notificacoes",
             "epidemiologia_castro.public.notificacoes"
     );
-
     private static final String BOOTSTRAP_SERVERS = "kafka:29092";
     private static final String GROUP_ID = "motor-analitico-epidemiologico";
 
     public static void main(String[] args) throws Exception {
         StreamExecutionEnvironment env =
                 StreamExecutionEnvironment.getExecutionEnvironment();
-
         env.setParallelism(1);
         env.enableCheckpointing(60000);
 
@@ -86,6 +86,19 @@ public class MotorAnalitico {
                 )
                 .process(new AvaliarRegra());
 
+        // === SINK KAFKA (ALERTAS) ===
+        KafkaSink<String> kafkaSink = KafkaSink.<String>builder()
+                .setBootstrapServers(BOOTSTRAP_SERVERS)
+                .setRecordSerializer(KafkaRecordSerializationSchema.builder()
+                        .setTopic("epidemiologia.alertas")
+                        .setValueSerializationSchema(new SimpleStringSchema())
+                        .build())
+                .setDeliveryGuarantee(DeliveryGuarantee.AT_LEAST_ONCE)
+                .build();
+
+        alertas.sinkTo(kafkaSink).name("Sink Kafka Alertas");
+
+        // Mantém o print para monitoramento
         alertas.print("ALERTA-EPIDEMIOLOGICO");
 
         env.execute("Motor Analitico Epidemiologico");
@@ -144,7 +157,6 @@ public class MotorAnalitico {
 
     public static class ExtrairNotificacao
             implements FlatMapFunction<String, Notificacao> {
-
         private transient ObjectMapper mapper;
 
         @Override
@@ -155,36 +167,27 @@ public class MotorAnalitico {
             if (mapper == null) {
                 mapper = new ObjectMapper();
             }
-
             JsonNode raiz = mapper.readTree(mensagem);
-
             if (raiz == null || raiz.get("after") == null
                     || raiz.get("after").isNull()) {
                 return;
             }
-
             JsonNode after = raiz.get("after");
-
             String municipio = texto(after, "municipio_residencia");
             String codigoIbge = texto(after, "codigo_ibge");
             String bairro = texto(after, "bairro");
             String doenca = texto(after, "doenca");
             String cid10 = texto(after, "cid_10");
-
             if (municipio.isEmpty()
                     || codigoIbge.isEmpty()
                     || doenca.isEmpty()) {
                 return;
             }
-
             long dataMicros = numero(after, "dt_notificacao");
-
             if (dataMicros <= 0) {
                 return;
             }
-
             long dataMillis = dataMicros / 1000L;
-
             out.collect(
                     new Notificacao(
                             dataMillis,
@@ -214,7 +217,6 @@ public class MotorAnalitico {
 
     public static class TimestampNotificacao
             implements SerializableTimestampAssigner<Notificacao> {
-
         @Override
         public long extractTimestamp(
                 Notificacao notificacao,
@@ -226,14 +228,12 @@ public class MotorAnalitico {
 
     public static class CriarChavesAnaliticas
             implements FlatMapFunction<Notificacao, RegistroAlerta> {
-
         @Override
         public void flatMap(
                 Notificacao notificacao,
                 Collector<RegistroAlerta> out
         ) {
             String cidade = notificacao.codigoIbge;
-
             if ("DENGUE".equals(notificacao.doenca)) {
                 out.collect(
                         new RegistroAlerta(
@@ -242,7 +242,6 @@ public class MotorAnalitico {
                                 notificacao
                         )
                 );
-
                 if (!notificacao.bairro.isEmpty()) {
                     out.collect(
                             new RegistroAlerta(
@@ -276,7 +275,6 @@ public class MotorAnalitico {
                     String,
                     TimeWindow
                     > {
-
         @Override
         public void process(
                 String chave,
@@ -289,7 +287,6 @@ public class MotorAnalitico {
             String municipio = "";
             String bairro = "";
             int mes = 1;
-
             for (RegistroAlerta evento : eventos) {
                 quantidade++;
                 doenca = evento.notificacao.doenca;
@@ -297,9 +294,7 @@ public class MotorAnalitico {
                 bairro = evento.notificacao.bairro;
                 mes = evento.notificacao.mes;
             }
-
             int limiar = obterLimiar(doenca, eventoTipo(chave), mes);
-
             if (quantidade >= limiar) {
                 out.collect(
                         String.format(
@@ -334,15 +329,12 @@ public class MotorAnalitico {
             if ("DENGUE".equals(doenca)) {
                 return "BAIRRO".equals(tipo) ? 5 : 10;
             }
-
             if ("MENINGITE".equals(doenca)) {
                 return 3;
             }
-
             if ("INFLUENZA".equals(doenca)) {
                 return estaNoOutonoOuInverno(mes) ? 200 : 120;
             }
-
             return Integer.MAX_VALUE;
         }
 
