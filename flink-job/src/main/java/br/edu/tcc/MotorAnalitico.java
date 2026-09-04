@@ -52,7 +52,7 @@ public class MotorAnalitico {
                 .setBootstrapServers(BOOTSTRAP_SERVERS)
                 .setTopics(TOPICOS)
                 .setGroupId(GROUP_ID)
-                .setStartingOffsets(OffsetsInitializer.earliest())
+                .setStartingOffsets(OffsetsInitializer.latest())
                 .setValueOnlyDeserializer(new SimpleStringSchema())
                 .build();
 
@@ -173,7 +173,7 @@ public class MotorAnalitico {
                 return;
             }
             JsonNode after = raiz.get("after");
-            String municipio = texto(after, "municipio_residencia");
+            String municipio = texto(after, "municipio_residencia").toUpperCase();
             String codigoIbge = texto(after, "codigo_ibge");
             String bairro = texto(after, "bairro");
             String doenca = texto(after, "doenca");
