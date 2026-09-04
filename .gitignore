@@ -1,0 +1,21 @@
+# Maven
+flink-job/target/
+
+# Docker volumes
+infra/data/
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Logs
+*.log
