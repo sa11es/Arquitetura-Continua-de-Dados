@@ -1,10 +1,10 @@
 version: "3.8"
 
 services:
-  # 1. Banco de Dados Legado (Ponta Grossa) (PostgreSQL com WAL habilitado)
-  postgres-legado:
+  # 1.1 Banco de Ponta Grossa
+  postgres-ponta-grossa:
     image: postgres:15
-    container_name: postgres-legado
+    container_name: postgres-ponta-grossa
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgrespassword
@@ -12,7 +12,6 @@ services:
     ports:
       - "5433:5432"
     volumes:
-      # Mapeia o script SQL para ser executado na inicializacao
       - ../database/init.sql:/docker-entrypoint-initdb.d/init.sql
     command:
       - "postgres"
@@ -24,7 +23,7 @@ services:
       timeout: 5s
       retries: 5
 
-      # 1.2 Banco de Curitiba
+  # 1.2 Banco de Curitiba
   postgres-curitiba:
     image: postgres:15
     container_name: postgres-curitiba
@@ -98,7 +97,9 @@ services:
     container_name: debezium-connect
     depends_on:
       - kafka
-      - postgres-legado
+      - postgres-ponta-grossa
+      - postgres-curitiba
+      - postgres-castro
     ports:
       - "8083:8083"
     environment:

@@ -1,7 +1,15 @@
 package br.edu.tcc;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import java.io.Serializable;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
 import org.apache.flink.api.common.eventtime.SerializableTimestampAssigner;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.functions.FlatMapFunction;
@@ -21,16 +29,8 @@ import org.apache.flink.streaming.api.windowing.time.Time;
 import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.util.Collector;
 
-import java.io.Serializable;
-import java.time.Instant;
-import java.time.ZoneId;
-import java.time.Month;
-import java.time.format.DateTimeFormatter;
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.time.Duration;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 public class MotorAnalitico {
 
@@ -43,8 +43,7 @@ public class MotorAnalitico {
     private static final String GROUP_ID = "motor-analitico-epidemiologico";
 
     public static void main(String[] args) throws Exception {
-        StreamExecutionEnvironment env =
-                StreamExecutionEnvironment.getExecutionEnvironment();
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(1);
         env.enableCheckpointing(60000);
 
@@ -67,13 +66,10 @@ public class MotorAnalitico {
                 .assignTimestampsAndWatermarks(
                         WatermarkStrategy
                                 .<Notificacao>forBoundedOutOfOrderness(Duration.ofMinutes(1))
-                                .withTimestampAssigner(
-                                        new TimestampNotificacao()
-                                )
+                                .withTimestampAssigner(new TimestampNotificacao())
                 );
 
-        DataStream<RegistroAlerta> registros =
-                notificacoes.flatMap(new CriarChavesAnaliticas());
+        DataStream<RegistroAlerta> registros = notificacoes.flatMap(new CriarChavesAnaliticas());
 
         DataStream<String> alertas = registros
                 .keyBy(
@@ -86,9 +82,8 @@ public class MotorAnalitico {
                                 Time.minutes(5)
                         )
                 )
-                .process(new AvaliarRegra());
+                .process(new ContarCasosJanela()); // Processador simplificado para contagem
 
-        // === SINK KAFKA (ALERTAS) ===
         KafkaSink<String> kafkaSink = KafkaSink.<String>builder()
                 .setBootstrapServers(BOOTSTRAP_SERVERS)
                 .setRecordSerializer(KafkaRecordSerializationSchema.builder()
@@ -99,9 +94,7 @@ public class MotorAnalitico {
                 .build();
 
         alertas.sinkTo(kafkaSink).name("Sink Kafka Alertas");
-
-        // Mantém o print para monitoramento
-        alertas.print("ALERTA-EPIDEMIOLOGICO");
+        alertas.print("CONTAGEM-EPIDEMIOLOGICA");
 
         env.execute("Motor Analitico Epidemiologico");
     }
@@ -113,7 +106,6 @@ public class MotorAnalitico {
         public String bairro;
         public String doenca;
         public String cid10;
-        public int mes;
 
         public Notificacao() {}
 
@@ -131,9 +123,6 @@ public class MotorAnalitico {
             this.bairro = bairro;
             this.doenca = doenca;
             this.cid10 = cid10;
-            this.mes = Instant.ofEpochMilli(timestamp)
-                    .atZone(ZoneId.of("America/Sao_Paulo"))
-                    .getMonthValue();
         }
     }
 
@@ -155,46 +144,53 @@ public class MotorAnalitico {
         }
     }
 
-    public static class ExtrairNotificacao
-            implements FlatMapFunction<String, Notificacao> {
+    public static class ExtrairNotificacao implements FlatMapFunction<String, Notificacao> {
         private transient ObjectMapper mapper;
 
         @Override
-        public void flatMap(
-                String mensagem,
-                Collector<Notificacao> out
-        ) throws Exception {
+        public void flatMap(String mensagem, Collector<Notificacao> out) throws Exception {
             if (mapper == null) {
                 mapper = new ObjectMapper();
             }
             JsonNode raiz = mapper.readTree(mensagem);
-            if (raiz == null || raiz.get("after") == null
-                    || raiz.get("after").isNull()) {
+            if (raiz == null || raiz.get("after") == null || raiz.get("after").isNull()) {
                 return;
             }
             JsonNode after = raiz.get("after");
+
             String municipio = texto(after, "municipio_residencia").toUpperCase();
             String codigoIbge = texto(after, "codigo_ibge");
-            String bairro = texto(after, "bairro");
-            String doenca = texto(after, "doenca");
+            String bairro = texto(after, "bairro").toUpperCase();
+            String doenca = texto(after, "doenca").toUpperCase();
             String cid10 = texto(after, "cid_10");
-            if (municipio.isEmpty()
-                    || codigoIbge.isEmpty()
-                    || doenca.isEmpty()) {
+
+            if (municipio.isEmpty() || codigoIbge.isEmpty() || doenca.isEmpty()) {
                 return;
             }
-            long dataMicros = numero(after, "dt_notificacao");
-            if (dataMicros <= 0) {
-                return;
+
+            long dataValue = numero(after, "dt_notificacao");
+            if (dataValue <= 0) {
+                dataValue = numero(after, "dt_sintomas");
             }
-            long dataMillis = dataMicros / 1000L;
+
+            long dataMillis;
+            if (dataValue <= 0) {
+                dataMillis = System.currentTimeMillis();
+            } else if (dataValue < 100000000000L) {
+                dataMillis = dataValue * 86400000L;
+            } else if (dataValue > 1000000000000000L) {
+                dataMillis = dataValue / 1000L;
+            } else {
+                dataMillis = dataValue;
+            }
+
             out.collect(
                     new Notificacao(
                             dataMillis,
                             municipio,
                             codigoIbge,
                             bairro,
-                            doenca.toUpperCase(),
+                            doenca,
                             cid10
                     )
             );
@@ -202,37 +198,25 @@ public class MotorAnalitico {
 
         private String texto(JsonNode node, String campo) {
             JsonNode valor = node.get(campo);
-            return valor == null || valor.isNull()
-                    ? ""
-                    : valor.asText().trim();
+            return valor == null || valor.isNull() ? "" : valor.asText().trim();
         }
 
         private long numero(JsonNode node, String campo) {
             JsonNode valor = node.get(campo);
-            return valor == null || valor.isNull()
-                    ? 0L
-                    : valor.asLong();
+            return valor == null || valor.isNull() ? 0L : valor.asLong();
         }
     }
 
-    public static class TimestampNotificacao
-            implements SerializableTimestampAssigner<Notificacao> {
+    public static class TimestampNotificacao implements SerializableTimestampAssigner<Notificacao> {
         @Override
-        public long extractTimestamp(
-                Notificacao notificacao,
-                long timestampAnterior
-        ) {
+        public long extractTimestamp(Notificacao notificacao, long timestampAnterior) {
             return notificacao.timestamp;
         }
     }
 
-    public static class CriarChavesAnaliticas
-            implements FlatMapFunction<Notificacao, RegistroAlerta> {
+    public static class CriarChavesAnaliticas implements FlatMapFunction<Notificacao, RegistroAlerta> {
         @Override
-        public void flatMap(
-                Notificacao notificacao,
-                Collector<RegistroAlerta> out
-        ) {
+        public void flatMap(Notificacao notificacao, Collector<RegistroAlerta> out) {
             String cidade = notificacao.codigoIbge;
             if ("DENGUE".equals(notificacao.doenca)) {
                 out.collect(
@@ -245,10 +229,7 @@ public class MotorAnalitico {
                 if (!notificacao.bairro.isEmpty()) {
                     out.collect(
                             new RegistroAlerta(
-                                    "DENGUE|BAIRRO|"
-                                            + cidade
-                                            + "|"
-                                            + notificacao.bairro,
+                                    "DENGUE|BAIRRO|" + cidade + "|" + notificacao.bairro,
                                     "BAIRRO",
                                     notificacao
                             )
@@ -257,9 +238,7 @@ public class MotorAnalitico {
             } else {
                 out.collect(
                         new RegistroAlerta(
-                                notificacao.doenca
-                                        + "|CIDADE|"
-                                        + cidade,
+                                notificacao.doenca + "|CIDADE|" + cidade,
                                 "CIDADE",
                                 notificacao
                         )
@@ -268,13 +247,10 @@ public class MotorAnalitico {
         }
     }
 
-    // === AVALIADOR DE REGRAS COM SAÍDA JSON ===
-    public static class AvaliarRegra
-            extends ProcessWindowFunction<
-                    RegistroAlerta,
-                    String,
-                    String,
-                    TimeWindow> {
+    /**
+     * ProcessWindowFunction focado exclusivamente na contagem dos casos acumulados na janela.
+     */
+    public static class ContarCasosJanela extends ProcessWindowFunction<RegistroAlerta, String, String, TimeWindow> {
 
         private transient ObjectMapper mapper;
 
@@ -293,95 +269,38 @@ public class MotorAnalitico {
                 mapper = new ObjectMapper();
             }
 
-            int quantidade = 0;
+            int quantidadeCasos = 0;
             String doenca = "";
             String municipio = "";
             String codigoIbge = "";
             String bairro = "";
-            int mes = 1;
 
             for (RegistroAlerta evento : eventos) {
-                quantidade++;
+                quantidadeCasos++;
                 doenca = evento.notificacao.doenca;
                 municipio = evento.notificacao.municipio;
                 codigoIbge = evento.notificacao.codigoIbge;
                 bairro = evento.notificacao.bairro;
-                mes = evento.notificacao.mes;
             }
 
-            String tipo = eventoTipo(chave);
-            int limiar = obterLimiar(doenca, tipo, mes);
+            if (quantidadeCasos > 0) {
+                String tipo = chave.contains("|BAIRRO|") ? "BAIRRO" : "CIDADE";
+                String janelaInicio = FMT_JANELA.format(Instant.ofEpochMilli(contexto.window().getStart()));
+                String janelaFim = FMT_JANELA.format(Instant.ofEpochMilli(contexto.window().getEnd()));
 
-            if (quantidade >= limiar) {
-                // Descrição legível da regra violada
-                String regra = limiar + " casos em 24h por "
-                        + ("BAIRRO".equals(tipo) ? "bairro" : "município");
+                Map<String, Object> payload = new HashMap<>();
+                payload.put("chave", chave);
+                payload.put("doenca", doenca);
+                payload.put("municipio", municipio);
+                payload.put("codigo_ibge", codigoIbge);
+                payload.put("bairro", bairro.isEmpty() ? "TODOS" : bairro);
+                payload.put("tipo_agregacao", tipo);
+                payload.put("quantidade_casos", quantidadeCasos);
+                payload.put("janela_inicio", janelaInicio);
+                payload.put("janela_fim", janelaFim);
 
-                // Cálculo de gravidade
-                String gravidade;
-                if (quantidade >= limiar * 2) {
-                    gravidade = "CRITICA";
-                } else if (quantidade >= (int) Math.ceil(limiar * 1.5)) {
-                    gravidade = "ALTA";
-                } else {
-                    gravidade = "MODERADA";
-                }
-
-                // Formata janela temporal em data legível
-                String janelaInicio = FMT_JANELA.format(
-                        Instant.ofEpochMilli(contexto.window().getStart()));
-                String janelaFim = FMT_JANELA.format(
-                        Instant.ofEpochMilli(contexto.window().getEnd()));
-
-                // Monta JSON do alerta
-                Map<String, Object> alerta = new HashMap<>();
-                alerta.put("doenca", doenca);
-                alerta.put("municipio", municipio);
-                alerta.put("codigo_ibge", codigoIbge);
-                alerta.put("bairro", bairro.isEmpty() ? "TODOS" : bairro);
-                alerta.put("regra_violada", regra);
-                alerta.put("tipo_agregacao", tipo);
-                alerta.put("quantidade", quantidade);
-                alerta.put("limiar", limiar);
-                alerta.put("gravidade", gravidade);
-                alerta.put("janela_inicio", janelaInicio);
-                alerta.put("janela_fim", janelaFim);
-                alerta.put("chave", chave);
-
-                out.collect(mapper.writeValueAsString(alerta));
+                out.collect(mapper.writeValueAsString(payload));
             }
-        }
-
-        private String eventoTipo(String chave) {
-            return chave.contains("|BAIRRO|")
-                    ? "BAIRRO"
-                    : "CIDADE";
-        }
-
-        private int obterLimiar(
-                String doenca,
-                String tipo,
-                int mes
-        ) {
-            if ("DENGUE".equals(doenca)) {
-                return "BAIRRO".equals(tipo) ? 5 : 10;
-            }
-            if ("MENINGITE".equals(doenca)) {
-                return 3;
-            }
-            if ("INFLUENZA".equals(doenca)) {
-                return estaNoOutonoOuInverno(mes) ? 200 : 120;
-            }
-            return Integer.MAX_VALUE;
-        }
-
-        private boolean estaNoOutonoOuInverno(int mes) {
-            return mes == Month.MARCH.getValue()
-                    || mes == Month.APRIL.getValue()
-                    || mes == Month.MAY.getValue()
-                    || mes == Month.JUNE.getValue()
-                    || mes == Month.JULY.getValue()
-                    || mes == Month.AUGUST.getValue();
         }
     }
 }

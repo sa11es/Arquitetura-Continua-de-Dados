@@ -1,335 +1,186 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="pt-BR">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dashboard Epidemiológico — Tempo Real</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: 'Segoe UI', Tahoma, sans-serif;
-            background: #0f172a;
-            color: #e2e8f0;
-            min-height: 100vh;
-        }
-        header {
-            background: linear-gradient(135deg, #1e3a5f, #0f172a);
-            padding: 20px 40px;
-            border-bottom: 2px solid #3b82f6;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        header h1 {
-            font-size: 1.6rem;
-            color: #93c5fd;
-        }
-        .status-indicator {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            font-size: 0.9rem;
-        }
-        .status-dot {
-            width: 10px; height: 10px;
-            border-radius: 50%;
-            background: #22c55e;
-            animation: pulse 2s infinite;
-        }
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
-        }
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-            padding: 20px;
-        }
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(4, 1fr);
-            gap: 15px;
-            margin-bottom: 30px;
-        }
-        .stat-card {
-            background: #1e293b;
-            border-radius: 12px;
-            padding: 20px;
-            text-align: center;
-            border: 1px solid #334155;
-            transition: transform 0.2s;
-        }
-        .stat-card:hover { transform: translateY(-3px); }
-        .stat-card .label {
-            font-size: 0.75rem;
-            color: #94a3b8;
-            text-transform: uppercase;
-            margin-bottom: 8px;
-        }
-        .stat-card .value {
-            font-size: 2rem;
-            font-weight: bold;
-        }
-        .stat-card.total .value { color: #60a5fa; }
-        .stat-card.critica .value { color: #ef4444; }
-        .stat-card.alta .value { color: #f97316; }
-        .stat-card.moderada .value { color: #eab308; }
-        .section-title {
-            font-size: 1.1rem;
-            color: #cbd5e1;
-            margin-bottom: 15px;
-            border-bottom: 1px solid #334155;
-            padding-bottom: 8px;
-        }
-        .main-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 20px;
-        }
-        .alert-list {
-            background: #1e293b;
-            border-radius: 12px;
-            padding: 20px;
-            max-height: 500px;
-            overflow-y: auto;
-        }
-        .alert-card {
-            background: #0f172a;
-            border-radius: 8px;
-            padding: 15px;
-            margin-bottom: 12px;
-            border-left: 4px solid #64748b;
-            animation: slideIn 0.3s ease;
-        }
-        @keyframes slideIn {
-            from { opacity: 0; transform: translateX(-20px); }
-            to { opacity: 1; transform: translateX(0); }
-        }
-        .alert-card.CRITICA { border-left-color: #ef4444; background: #1a0a0a; }
-        .alert-card.ALTA { border-left-color: #f97316; background: #1a100a; }
-        .alert-card.MODERADA { border-left-color: #eab308; background: #1a1a0a; }
-        .alert-card .header-row {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 8px;
-        }
-        .alert-card .doenca {
-            font-size: 1.1rem;
-            font-weight: bold;
-            text-transform: uppercase;
-        }
-        .badge {
-            padding: 3px 10px;
-            border-radius: 12px;
-            font-size: 0.7rem;
-            font-weight: bold;
-            text-transform: uppercase;
-        }
-        .badge.CRITICA { background: #ef4444; color: #fff; }
-        .badge.ALTA { background: #f97316; color: #fff; }
-        .badge.MODERADA { background: #eab308; color: #000; }
-        .alert-card .info {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 6px;
-            font-size: 0.85rem;
-            color: #94a3b8;
-        }
-        .alert-card .info .label {
-            color: #64748b;
-        }
-        .alert-card .regra {
-            margin-top: 8px;
-            padding: 8px;
-            background: rgba(59, 130, 246, 0.1);
-            border-radius: 6px;
-            font-size: 0.85rem;
-            color: #93c5fd;
-        }
-        .breakdown {
-            background: #1e293b;
-            border-radius: 12px;
-            padding: 20px;
-        }
-        .breakdown-item {
-            display: flex;
-            justify-content: space-between;
-            padding: 8px 0;
-            border-bottom: 1px solid #334155;
-            font-size: 0.9rem;
-        }
-        .breakdown-item:last-child { border-bottom: none; }
-        .breakdown-item .name { color: #cbd5e1; }
-        .breakdown-item .count { color: #60a5fa; font-weight: bold; }
-        .no-alerts {
-            text-align: center;
-            padding: 40px;
-            color: #64748b;
-        }
-        .alert-list::-webkit-scrollbar { width: 6px; }
-        .alert-list::-webkit-scrollbar-track { background: #0f172a; }
-        .alert-list::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
-    </style>
-</head>
-<body>
-    <header>
-        <h1>🦠 Dashboard de Vigilância Epidemiológica</h1>
-        <div class="status-indicator">
-            <div class="status-dot"></div>
-            <span id="ws-status">Conectado</span>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Monitoramento Epidemiológico em Tempo Real</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+  </head>
+  <body class="bg-slate-900 text-slate-100 min-h-screen p-6">
+    <div class="max-w-7xl mx-auto space-y-6">
+      <!-- HEADER -->
+      <header
+        class="flex justify-between items-center border-b border-slate-800 pb-4"
+      >
+        <div>
+          <h1 class="text-2xl font-bold text-sky-400">
+            📊 Painel Epidemiológico (Flink + Kafka)
+          </h1>
+          <p class="text-xs text-slate-400">
+            Agregação dinâmica de casos em janelas de 24h
+          </p>
         </div>
-    </header>
-
-    <div class="container">
-        <!-- Cards de estatísticas -->
-        <div class="stats-grid">
-            <div class="stat-card total">
-                <div class="label">Total de Alertas</div>
-                <div class="value" id="stat-total">0</div>
-            </div>
-            <div class="stat-card critica">
-                <div class="label">Críticos</div>
-                <div class="value" id="stat-critica">0</div>
-            </div>
-            <div class="stat-card alta">
-                <div class="label">Alta Gravidade</div>
-                <div class="value" id="stat-alta">0</div>
-            </div>
-            <div class="stat-card moderada">
-                <div class="label">Moderados</div>
-                <div class="value" id="stat-moderada">0</div>
-            </div>
+        <div
+          id="status-conexao"
+          class="px-3 py-1 text-xs font-semibold rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20"
+        >
+          Conectando...
         </div>
+      </header>
 
-        <div class="main-grid">
-            <!-- Lista de alertas em tempo real -->
-            <div>
-                <div class="section-title">📡 Alertas em Tempo Real</div>
-                <div class="alert-list" id="alert-list">
-                    <div class="no-alerts">
-                        Aguardando alertas do pipeline...
-                    </div>
-                </div>
-            </div>
-
-            <!-- Breakdown por doença e cidade -->
-            <div>
-                <div class="section-title">📊 Distribuição por Doença</div>
-                <div class="breakdown" id="breakdown-doenca">
-                    <div class="no-alerts">Sem dados</div>
-                </div>
-
-                <div class="section-title" style="margin-top: 20px;">
-                    🏙️ Distribuição por Município
-                </div>
-                <div class="breakdown" id="breakdown-cidade">
-                    <div class="no-alerts">Sem dados</div>
-                </div>
-            </div>
+      <!-- CARDS DE ESTATÍSTICAS -->
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div class="bg-slate-800 p-5 rounded-xl border border-slate-700">
+          <span
+            class="text-xs font-medium text-slate-400 uppercase tracking-wider"
+            >Total de Casos (Janela 24h)</span
+          >
+          <div id="stat-total" class="text-3xl font-bold text-sky-400 mt-2">
+            0
+          </div>
         </div>
+        <div class="bg-slate-800 p-5 rounded-xl border border-slate-700">
+          <span
+            class="text-xs font-medium text-slate-400 uppercase tracking-wider"
+            >Casos por Município</span
+          >
+          <div id="stat-cidades" class="text-sm space-y-1 mt-2 text-slate-300">
+            <span class="text-slate-500 italic">Aguardando dados...</span>
+          </div>
+        </div>
+        <div class="bg-slate-800 p-5 rounded-xl border border-slate-700">
+          <span
+            class="text-xs font-medium text-slate-400 uppercase tracking-wider"
+            >Casos por Agravo/Doença</span
+          >
+          <div id="stat-doencas" class="text-sm space-y-1 mt-2 text-slate-300">
+            <span class="text-slate-500 italic">Aguardando dados...</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- TABELA DE ATUALIZAÇÕES EM TEMPO REAL -->
+      <div
+        class="bg-slate-800 rounded-xl border border-slate-700 overflow-hidden"
+      >
+        <div class="p-4 border-b border-slate-700 font-semibold text-slate-200">
+          ⚡ Feed de Contagens Recebidas do Flink
+        </div>
+        <div class="overflow-x-auto">
+          <table class="w-full text-left text-sm">
+            <thead
+              class="bg-slate-900/50 text-slate-400 border-b border-slate-700"
+            >
+              <tr>
+                <th class="p-3">Doença</th>
+                <th class="p-3">Município</th>
+                <th class="p-3">Bairro / Escopo</th>
+                <th class="p-3">Casos Acumulados</th>
+                <th class="p-3">Fim da Janela</th>
+                <th class="p-3">Recebido às</th>
+              </tr>
+            </thead>
+            <tbody id="tabela-feed" class="divide-y divide-slate-700/50">
+              <tr>
+                <td colspan="6" class="p-4 text-center text-slate-500 italic">
+                  Nenhuma atualização recebida até o momento.
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
 
     <script>
-        const ws = new WebSocket("ws://localhost:8501/ws");
-        let allAlerts = [];
+      const ws = new WebSocket(`ws://${window.location.host}/ws`);
+      const statusEl = document.getElementById("status-conexao");
+      const statTotal = document.getElementById("stat-total");
+      const statCidades = document.getElementById("stat-cidades");
+      const statDoencas = document.getElementById("stat-doencas");
+      const tabelaFeed = document.getElementById("tabela-feed");
 
-        ws.onopen = function() {
-            document.getElementById("ws-status").textContent = "Conectado";
-        };
+      let historicoContagens = [];
 
-        ws.onmessage = function(event) {
-            const msg = JSON.parse(event.data);
+      ws.onopen = () => {
+        statusEl.textContent = "● Ao Vivo";
+        statusEl.className =
+          "px-3 py-1 text-xs font-semibold rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20";
+      };
 
-            if (msg.tipo === "historico") {
-                allAlerts = msg.dados;
-                renderAlerts();
-            } else if (msg.tipo === "alerta") {
-                allAlerts.unshift(msg.dados);
-                if (allAlerts.length > 100) allAlerts.pop();
-                renderAlerts();
-            } else if (msg.tipo === "stats") {
-                updateStats(msg.dados);
-            }
-        };
+      ws.onclose = () => {
+        statusEl.textContent = "○ Desconectado";
+        statusEl.className =
+          "px-3 py-1 text-xs font-semibold rounded-full bg-rose-500/10 text-rose-400 border border-rose-500/20";
+      };
 
-        ws.onclose = function() {
-            document.getElementById("ws-status").textContent = "Desconectado";
-            document.querySelector(".status-dot").style.background = "#ef4444";
-        };
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
 
-        function renderAlerts() {
-            const list = document.getElementById("alert-list");
+        if (msg.tipo === "stats") {
+          atualizarEstatisticas(msg.dados);
+        } else if (msg.tipo === "alerta") {
+          adicionarAoFeed(msg.dados);
+        } else if (msg.tipo === "historico") {
+          historicoContagens = msg.dados;
+          renderizarFeed();
+        }
+      };
 
-            if (allAlerts.length === 0) {
-                list.innerHTML = '<div class="no-alerts">Aguardando alertas do pipeline...</div>';
-                return;
-            }
+      function atualizarEstatisticas(stats) {
+        statTotal.textContent = stats.total_casos || 0;
 
-            list.innerHTML = allAlerts.map(a => {
-                const gravidade = a.gravidade || "MODERADA";
-                const bairro = a.bairro === "TODOS" ? "" : ` — ${a.bairro}`;
-                return `
-                    <div class="alert-card ${gravidade}">
-                        <div class="header-row">
-                            <span class="doenca">${a.doenca}</span>
-                            <span class="badge ${gravidade}">${gravidade}</span>
-                        </div>
-                        <div class="info">
-                            <div><span class="label">Município:</span> ${a.municipio}${bairro}</div>
-                            <div><span class="label">Código IBGE:</span> ${a.codigo_ibge}</div>
-                            <div><span class="label">Casos:</span> ${a.quantidade}</div>
-                            <div><span class="label">Limiar:</span> ${a.limiar}</div>
-                            <div><span class="label">Agregação:</span> ${a.tipo_agregacao}</div>
-                            <div><span class="label">Recebido:</span> ${(a.recebido_em || '').substring(11, 19)}</div>
-                        </div>
-                        <div class="regra">
-                            ⚠️ ${a.regra_violada}
-                        </div>
-                        <div style="margin-top: 6px; font-size: 0.75rem; color: #475569;">
-                            Janela: ${a.janela_inicio} → ${a.janela_fim}
-                        </div>
-                    </div>
-                `;
-            }).join("");
+        // Renderiza Casos por Cidade
+        if (
+          stats.casos_por_cidade &&
+          Object.keys(stats.casos_por_cidade).length > 0
+        ) {
+          statCidades.innerHTML = Object.entries(stats.casos_por_cidade)
+            .map(
+              ([cidade, qtd]) =>
+                `<div class="flex justify-between"><span>${cidade}:</span><b class="text-sky-400">${qtd}</b></div>`,
+            )
+            .join("");
         }
 
-        function updateStats(s) {
-            document.getElementById("stat-total").textContent = s.total_alertas || 0;
-            document.getElementById("stat-critica").textContent =
-                (s.alertas_por_gravidade || {}).CRITICA || 0;
-            document.getElementById("stat-alta").textContent =
-                (s.alertas_por_gravidade || {}).ALTA || 0;
-            document.getElementById("stat-moderada").textContent =
-                (s.alertas_por_gravidade || {}).MODERADA || 0;
-
-            // Breakdown por doença
-            const bdDoenca = document.getElementById("breakdown-doenca");
-            const doencas = s.alertas_por_doenca || {};
-            const entriesD = Object.entries(doencas).sort((a,b) => b[1] - a[1]);
-            bdDoenca.innerHTML = entriesD.length > 0
-                ? entriesD.map(([nome, count]) =>
-                    `<div class="breakdown-item"><span class="name">${nome}</span><span class="count">${count}</span></div>`
-                ).join("")
-                : '<div class="no-alerts">Sem dados</div>';
-
-            // Breakdown por cidade
-            const bdCidade = document.getElementById("breakdown-cidade");
-            const cidades = s.alertas_por_cidade || {};
-            const entriesC = Object.entries(cidades).sort((a,b) => b[1] - a[1]);
-            bdCidade.innerHTML = entriesC.length > 0
-                ? entriesC.map(([nome, count]) =>
-                    `<div class="breakdown-item"><span class="name">${nome}</span><span class="count">${count}</span></div>`
-                ).join("")
-                : '<div class="no-alerts">Sem dados</div>';
+        // Renderiza Casos por Doença
+        if (
+          stats.casos_por_doenca &&
+          Object.keys(stats.casos_por_doenca).length > 0
+        ) {
+          statDoencas.innerHTML = Object.entries(stats.casos_por_doenca)
+            .map(
+              ([doenca, qtd]) =>
+                `<div class="flex justify-between"><span>${doenca}:</span><b class="text-sky-400">${qtd}</b></div>`,
+            )
+            .join("");
         }
+      }
 
-        // Busca stats iniciais via REST
-        fetch("/api/stats").then(r => r.json()).then(updateStats).catch(() => {});
-        fetch("/api/alertas").then(r => r.json()).then(d => {
-            allAlerts = d.alertas || [];
-            renderAlerts();
-        }).catch(() => {});
+      function adicionarAoFeed(item) {
+        historicoContagens.unshift(item);
+        if (historicoContagens.length > 50) historicoContagens.pop();
+        renderizarFeed();
+      }
+
+      function renderizarFeed() {
+        if (historicoContagens.length === 0) return;
+
+        tabelaFeed.innerHTML = historicoContagens
+          .map(
+            (item) => `
+                <tr class="hover:bg-slate-700/30 transition-colors">
+                    <td class="p-3 font-semibold text-sky-400">${item.doenca || "-"}</td>
+                    <td class="p-3">${item.municipio || "-"}</td>
+                    <td class="p-3 text-slate-400">${item.bairro || "TODOS"}</td>
+                    <td class="p-3 font-bold text-amber-400 text-base">${item.quantidade_casos}</td>
+                    <td class="p-3 text-xs text-slate-400">${item.janela_fim || "-"}</td>
+                    <td class="p-3 text-xs text-slate-500">${item.recebido_em ? new Date(item.recebido_em).toLocaleTimeString() : "-"}</td>
+                </tr>
+            `,
+          )
+          .join("");
+      }
     </script>
-</body>
+  </body>
 </html>
