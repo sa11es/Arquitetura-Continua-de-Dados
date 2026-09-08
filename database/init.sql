@@ -1,4 +1,4 @@
-CREATE TABLE notificacoes_dengue (
+CREATE TABLE notificacoes (
     id_notificacao SERIAL PRIMARY KEY,
     dt_notificacao TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     dt_sintomas DATE NOT NULL,
@@ -24,6 +24,6 @@ END;
 $$ LANGUAGE plpgsql;
 
 CREATE TRIGGER trigger_atualiza_notificacao
-BEFORE UPDATE ON notificacoes_dengue
+BEFORE UPDATE ON notificacoes
 FOR EACH ROW
 EXECUTE FUNCTION atualiza_timestamp();
