@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Monitoramento Epidemiológico em Tempo Real</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+  </head>
+  <body class="bg-slate-900 text-slate-100 min-h-screen p-6">
+    <div class="max-w-7xl mx-auto space-y-6">
+      <!-- HEADER -->
+      <header
+        class="flex justify-between items-center border-b border-slate-800 pb-4"
+      >
+        <div>
+          <h1 class="text-2xl font-bold text-sky-400">
+            📊 Painel Epidemiológico (Flink + Kafka)
+          </h1>
+          <p class="text-xs text-slate-400">
+            Agregação dinâmica de casos em janelas de 24h
+          </p>
+        </div>
+        <div
+          id="status-conexao"
+          class="px-3 py-1 text-xs font-semibold rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20"
+        >
+          Conectando...
+        </div>
+      </header>
+
+      <!-- CARDS DE ESTATÍSTICAS -->
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div class="bg-slate-800 p-5 rounded-xl border border-slate-700">
+          <span
+            class="text-xs font-medium text-slate-400 uppercase tracking-wider"
+            >Total de Casos (Janela 24h)</span
+          >
+          <div id="stat-total" class="text-3xl font-bold text-sky-400 mt-2">
+            0
+          </div>
+        </div>
+        <div class="bg-slate-800 p-5 rounded-xl border border-slate-700">
+          <span
+            class="text-xs font-medium text-slate-400 uppercase tracking-wider"
+            >Casos por Município</span
+          >
+          <div id="stat-cidades" class="text-sm space-y-1 mt-2 text-slate-300">
+            <span class="text-slate-500 italic">Aguardando dados...</span>
+          </div>
+        </div>
+        <div class="bg-slate-800 p-5 rounded-xl border border-slate-700">
+          <span
+            class="text-xs font-medium text-slate-400 uppercase tracking-wider"
+            >Casos por Agravo/Doença</span
+          >
+          <div id="stat-doencas" class="text-sm space-y-1 mt-2 text-slate-300">
+            <span class="text-slate-500 italic">Aguardando dados...</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- TABELA DE ATUALIZAÇÕES EM TEMPO REAL -->
+      <div
+        class="bg-slate-800 rounded-xl border border-slate-700 overflow-hidden"
+      >
+        <div class="p-4 border-b border-slate-700 font-semibold text-slate-200">
+          ⚡ Feed de Contagens Recebidas do Flink
+        </div>
+        <div class="overflow-x-auto">
+          <table class="w-full text-left text-sm">
+            <thead
+              class="bg-slate-900/50 text-slate-400 border-b border-slate-700"
+            >
+              <tr>
+                <th class="p-3">Doença</th>
+                <th class="p-3">Município</th>
+                <th class="p-3">Bairro / Escopo</th>
+                <th class="p-3">Casos Acumulados</th>
+                <th class="p-3">Fim da Janela</th>
+                <th class="p-3">Recebido às</th>
+              </tr>
+            </thead>
+            <tbody id="tabela-feed" class="divide-y divide-slate-700/50">
+              <tr>
+                <td colspan="6" class="p-4 text-center text-slate-500 italic">
+                  Nenhuma atualização recebida até o momento.
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const ws = new WebSocket(`ws://${window.location.host}/ws`);
+      const statusEl = document.getElementById("status-conexao");
+      const statTotal = document.getElementById("stat-total");
+      const statCidades = document.getElementById("stat-cidades");
+      const statDoencas = document.getElementById("stat-doencas");
+      const tabelaFeed = document.getElementById("tabela-feed");
+
+      let historicoContagens = [];
+
+      ws.onopen = () => {
+        statusEl.textContent = "● Ao Vivo";
+        statusEl.className =
+          "px-3 py-1 text-xs font-semibold rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20";
+      };
+
+      ws.onclose = () => {
+        statusEl.textContent = "○ Desconectado";
+        statusEl.className =
+          "px-3 py-1 text-xs font-semibold rounded-full bg-rose-500/10 text-rose-400 border border-rose-500/20";
+      };
+
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+
+        if (msg.tipo === "stats") {
+          atualizarEstatisticas(msg.dados);
+        } else if (msg.tipo === "alerta") {
+          adicionarAoFeed(msg.dados);
+        } else if (msg.tipo === "historico") {
+          historicoContagens = msg.dados;
+          renderizarFeed();
+        }
+      };
+
+      function atualizarEstatisticas(stats) {
+        statTotal.textContent = stats.total_casos || 0;
+
+        // Renderiza Casos por Cidade
+        if (
+          stats.casos_por_cidade &&
+          Object.keys(stats.casos_por_cidade).length > 0
+        ) {
+          statCidades.innerHTML = Object.entries(stats.casos_por_cidade)
+            .map(
+              ([cidade, qtd]) =>
+                `<div class="flex justify-between"><span>${cidade}:</span><b class="text-sky-400">${qtd}</b></div>`,
+            )
+            .join("");
+        }
+
+        // Renderiza Casos por Doença
+        if (
+          stats.casos_por_doenca &&
+          Object.keys(stats.casos_por_doenca).length > 0
+        ) {
+          statDoencas.innerHTML = Object.entries(stats.casos_por_doenca)
+            .map(
+              ([doenca, qtd]) =>
+                `<div class="flex justify-between"><span>${doenca}:</span><b class="text-sky-400">${qtd}</b></div>`,
+            )
+            .join("");
+        }
+      }
+
+      function adicionarAoFeed(item) {
+        historicoContagens.unshift(item);
+        if (historicoContagens.length > 50) historicoContagens.pop();
+        renderizarFeed();
+      }
+
+      function renderizarFeed() {
+        if (historicoContagens.length === 0) return;
+
+        tabelaFeed.innerHTML = historicoContagens
+          .map(
+            (item) => `
+                <tr class="hover:bg-slate-700/30 transition-colors">
+                    <td class="p-3 font-semibold text-sky-400">${item.doenca || "-"}</td>
+                    <td class="p-3">${item.municipio || "-"}</td>
+                    <td class="p-3 text-slate-400">${item.bairro || "TODOS"}</td>
+                    <td class="p-3 font-bold text-amber-400 text-base">${item.quantidade_casos}</td>
+                    <td class="p-3 text-xs text-slate-400">${item.janela_fim || "-"}</td>
+                    <td class="p-3 text-xs text-slate-500">${item.recebido_em ? new Date(item.recebido_em).toLocaleTimeString() : "-"}</td>
+                </tr>
+            `,
+          )
+          .join("");
+      }
+    </script>
+  </body>
+</html>
