@@ -29,8 +29,8 @@ stats = {
 
 def deve_emitir_alerta(alerta: dict) -> bool:
     """
-    Filtra mensagens repetidas vindas da janela deslizante do Flink.
-    Retorna True se for uma chave nova ou se a quantidade de casos mudou.
+    Filtra mensagens e garante que a contagem de uma mesma chave
+    NUNCA regrida (trata mensagens fora de ordem e sub-janelas).
     """
     chave = alerta.get("chave")
     qtd_atual = alerta.get("quantidade_casos", 0)
@@ -39,10 +39,15 @@ def deve_emitir_alerta(alerta: dict) -> bool:
         return True
 
     registro_anterior = ultimos_registros.get(chave)
-    if (
-        registro_anterior is None
-        or registro_anterior.get("quantidade_casos") != qtd_atual
-    ):
+    
+    # Se for o primeiro registro dessa chave, aceita
+    if registro_anterior is None:
+        return True
+
+    qtd_anterior = registro_anterior.get("quantidade_casos", 0)
+
+    # TRAVA ANTI-OSCILAÇÃO: Aceita APENAS se a nova contagem for estritamente MAIOR
+    if qtd_atual > qtd_anterior:
         return True
 
     return False
@@ -78,7 +83,7 @@ def consumir_kafka():
         "epidemiologia.alertas",
         bootstrap_servers=["localhost:9092"],
         auto_offset_reset="latest",
-        group_id="dashboard-server-v5",
+        group_id="dashboard-server-v7",  # Atualizado o group_id para resetar leituras
         value_deserializer=lambda x: x.decode("utf-8"),
     )
     print("[Kafka] Consumer iniciado — aguardando contagens do Flink...")
@@ -103,7 +108,7 @@ def consumir_kafka():
                 )
             else:
                 print(
-                    f"[Kafka] 🔇 Duplicado descartado (Janela sem alteração): {alerta.get('chave')}"
+                    f"[Kafka] 🔇 Duplicado ou valor menor descartado: {alerta.get('chave')} ({alerta.get('quantidade_casos')} casos)"
                 )
 
         except Exception as e:
