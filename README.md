@@ -232,3 +232,415 @@ docker compose down
    - _Cenário de Surto_: injeção abrupta de registros para estressar a vazão da arquitetura (pode exigir escalar o `flink-taskmanager` via `docker compose up -d --scale flink-taskmanager=2` para aumentar os task slots disponíveis).
 4. **Adicionar volumes persistentes** ao `docker-compose.yml` (opcional, mas recomendado) para não perder dados/conectores a cada reinicialização durante o desenvolvimento.
 5. **Documentar os resultados** comparando a implementação original (`SlidingEventTimeWindows`) com a atual (`KeyedProcessFunction`) em termos de latência e uso de estado, para a seção de resultados do TCC.
+
+
+
+README MURILO // VERSÃO 23/09 (após ajustes de inserções com escalas corretas)
+
+GUIA DE EXECUÇÃO DA POC — SISTEMA DE VIGILÂNCIA EPIDEMIOLÓGICA EM TEMPO REAL
+
+Manual Operacional de Validação de Ponta a Ponta no Ambiente Windows (PowerShell)
+
+23 de setembro de 2026
+
+1. Pré-requisitos do Ambiente
+Esta seção estabelece os componentes de software necessários para a reprodução integral da Prova de Conceito (PoC). O fluxo operacional dispensa a instalação local de Java Development Kit (JDK) ou Apache Maven no sistema hospedeiro, uma vez que o processo de compilação do artefato do Apache Flink é inteiramente encapsulado em contêineres Docker.
+
+1.1 Softwares Necessários
+Sistema Operacional: Microsoft Windows 10 ou 11 (64-bit) com terminal PowerShell 5.1 ou superior.
+Docker Desktop: Instalado e em execução com suporte a contêineres Linux (WSL 2 backend).
+Git: Cliente de versionamento distribuído configurado no PATH.
+Python: Versão 3.10 ou superior instalada no hospedeiro.
+1.2 Verificação do Docker Desktop
+Antes de iniciar os procedimentos, certifique-se de que a interface de integração do daemon Docker está acessível:
+
+powershell
+
+
+docker version
+Saída esperada:
+
+text
+
+
+Client:<br/>
+ Version:           24.0.7<br/>
+ API version:       1.43
+ ...
+Server: Docker Desktop<br/>
+ Engine:<br/>
+  Version:          24.0.7<br/>
+  API version:      1.43
+Critério de aprovação: Exibição bem-sucedida das seções Client e Server sem exceções de conexão nomeada de canal (named pipe).
+
+1.3 Instalação de Dependências Python
+Execute a instalação das bibliotecas requeridas para a execução do simulador de carga, conectores de banco e interface analítica:
+
+powershell
+
+
+pip install psycopg2-binary fastapi uvicorn websockets kafka-python
+Critério de aprovação: Mensagem Successfully installed ou Requirement already satisfied para todos os pacotes requisitados.
+
+2. Passo 1 — Inicialização da Infraestrutura Distribuída
+A topologia base compreende instâncias isoladas de bancos de dados relacionais transacionais (PostgreSQL) para três municípios paranaenses, mensageria distribuída (Apache Kafka e Apache Zookeeper), motor de captura de dados alterados (Debezium Connect) e infraestrutura de processamento de fluxo (Apache Flink JobManager e TaskManager).
+
+Atenção: A configuração do Compose não utiliza volumes persistentes mapeados para o disco rígido do hospedeiro. O comando docker compose down expurga completamente os registros dos bancos e tópicos Kafka, exigindo a reinscrição dos conectores CDC no Debezium.
+
+2.1 Atualização de Código e Subida dos Contêineres
+powershell
+
+
+cd C:\Users\muril\Documents\TCC
+git pull origin multi-databases
+cd C:\Users\muril\Documents\TCC\infra
+docker compose up -d
+2.2 Verificação de Saúde dos Contêineres
+powershell
+
+
+docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+Saída esperada:
+
+text
+
+
+NAMES                   STATUS                        PORTS
+kafka                   Up About a minute             0.0.0.0:9092->9092/tcp, [::]:9092->9092/tcp
+zookeeper               Up About a minute             2181/tcp, 2888/tcp, 3888/tcp
+postgres-ponta-grossa   Up About a minute (healthy)   0.0.0.0:5433->5432/tcp, [::]:5433->5432/tcp<br/>
+postgres-curitiba       Up About a minute (healthy)   0.0.0.0:5434->5432/tcp, [::]:5434->5432/tcp<br/>
+postgres-castro         Up About a minute (healthy)   0.0.0.0:5435->5432/tcp, [::]:5435->5432/tcp<br/>
+debezium-connect        Up About a minute             0.0.0.0:8083->8083/tcp, [::]:8083->8083/tcp<br/>
+flink-jobmanager        Up About a minute             0.0.0.0:8081->8081/tcp, [::]:8081->8081/tcp
+flink-taskmanager       Up About a minute             6123/tcp, 8081/tcp
+Critério de aprovação: Exatamente 8 contêineres em estado Up, com as 3 bases PostgreSQL reportando (healthy). Eventual aviso sobre contêiner órfão postgres-legado deve ser ignorado.
+
+Nota: Aguarde 120 segundos para que o framework Java interno do Debezium Connect conclua o provisionamento da porta REST 8083.
+
+3. Passo 2 — Ativação e Validação do CDC (Debezium)
+O conector CDC realiza a extração de dados contínua baseada em leitura direta do log de escrita prévia (Write-Ahead Log — WAL) do PostgreSQL, propagando as notificações municipais em tópicos de granularidade única.
+
+3.1 Verificação da Interface REST do Conector
+powershell
+
+
+Invoke-RestMethod http://localhost:8083/connectors
+Critério de aprovação: A API deve responder com código HTTP 200, retornando um array (vazio ou com inscrições preexistentes), sem lançar falha de conexão.
+
+3.2 Registro dos Conectores Municipais
+powershell
+
+
+cd C:\Users\muril\Documents\TCC
+python ativar_cdc_debezium.py
+3.3 Inspeção de Estado das Tarefas dos Conectores
+powershell
+
+
+$conectores = Invoke-RestMethod http://localhost:8083/connectors
+foreach ($c in $conectores) {
+    $r = Invoke-RestMethod "http://localhost:8083/connectors/$c/status"<br/>
+    "$c  ->  $($r.connector.state)  |  tasks: $($r.tasks.state -join ',')"
+}
+Saída esperada:
+
+text
+
+
+sinan-postgres-connector  ->  RUNNING  |  tasks: FAILED<br/>
+sinan-postgres-castro     ->  RUNNING  |  tasks: RUNNING<br/>
+sinan-postgres-curitiba   ->  RUNNING  |  tasks: RUNNING<br/>
+sinan-postgres-ponta-grossa ->  RUNNING  |  tasks: RUNNING
+Critério de aprovação: Os conectores sinan-postgres-castro, sinan-postgres-curitiba e sinan-postgres-ponta-grossa devem estar estritamente em RUNNING tanto no conector quanto nas tasks. O conector legado sinan-postgres-connector com tarefas em FAILED é inofensivo.
+
+3.4 Confirmação dos Tópicos no Apache Kafka
+powershell
+
+
+docker exec kafka kafka-topics --bootstrap-server kafka:29092 --list
+Critério de aprovação: Presença confirmada de:
+
+epidemiologia_curitiba.public.notificacoes
+epidemiologia_ponta_grossa.public.notificacoes
+epidemiologia_castro.public.notificacoes
+epidemiologia.alertas
+4. Passo 3 — Inspeção Estática e Compilação do Artefato Java
+Para mitigar as instabilidades de consumo e falhas de retenção de janelas anteriores, o componente analítico adota processamento com retenção explícita de estado via KeyedProcessFunction e registro controlado por identificador de grupo versionado.
+
+4.1 Validação Estrutural do Código-Fonte
+powershell
+
+
+cd C:\Users\muril\Documents\TCC
+Get-ChildItem .\flink-job\src -Recurse -Filter *.java | Select-String -Pattern "KeyedProcessFunction|enableCheckpointing|setCheckpointStorage|FileSystemCheckpointStorage|GROUP_ID"
+Critério de aprovação: Confirmação da importação da classe KeyedProcessFunction, invocação do método enableCheckpointing(60000) e atribuição de GROUP_ID = "motor-analitico-epidemiologico-v2".
+
+4.2 Compilação Isolada via Contêiner Docker
+powershell
+
+
+cd C:\Users\muril\Documents\TCC\flink-job<br/>
+docker run --rm -v "${PWD}:/usr/src/app" -w /usr/src/app maven:3.9-eclipse-temurin-17 mvn clean package -DskipTests
+Critério de aprovação: Finalização do processo com a mensagem conclusiva [INFO] BUILD SUCCESS.
+
+Nota Técnica: Tratamento de Caractere Oculto (BOM): Se a compilação falhar com o erro illegal character: '\ufeff', execute no PowerShell a remoção da marca d'água UTF-8 gerada por editores Windows e recompile:
+
+powershell
+
+
+$path = ".\src\main\java\br\edu\tcc\MotorAnalitico.java"
+$content = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+if ($content[0] -eq [char]0xFEFF) {
+    $content = $content.Substring(1)
+    [System.IO.File]::WriteAllText($path, $content, [System.Text.UTF8Encoding]::new($false))
+}
+4.3 Confirmação do Pacote Gerado
+powershell
+
+
+Get-ChildItem .\target\*.jar | Select-Object Name, Length, LastWriteTime
+Critério de aprovação: Geração do arquivo motor-analitico-epidemiologico-1.0-SNAPSHOT.jar (fat JAR com dependências) com tamanho aproximado de 2,8 MB (2.799.576 bytes). O arquivo de prefixo original-* (14 KB) não deve ser utilizado.
+
+5. Passo 4 — Submissão do Job ao Cluster Apache Flink
+O envio do pacote compilado ao Flink JobManager é realizado por chamadas REST multipart, seguido pelo acionamento assíncrono do grafo de execução.
+
+5.1 Envio do Artefato Binário
+powershell
+
+
+cd C:\Users\muril\Documents\TCC\flink-job<br/>
+curl.exe -sS -X POST -H "Expect:" -F "jarfile=@target/motor-analitico-epidemiologico-1.0-SNAPSHOT.jar" http://localhost:8081/jars/upload
+Saída esperada:
+
+json
+
+
+{"filename":"/tmp/flink-web-upload/42515378-136d-4a51-93be-28b3259ddc27_motor-analitico-epidemiologico-1.0-SNAPSHOT.jar","status":"success"}
+5.2 Disparo do Grafo de Operadores
+Isole exclusivamente o nome do arquivo gerado no campo filename (removendo o prefixo de diretório):
+
+powershell
+
+
+$jarId = "42515378-136d-4a51-93be-28b3259ddc27_motor-analitico-epidemiologico-1.0-SNAPSHOT.jar"
+curl.exe -sS -X POST "http://localhost:8081/jars/$jarId/run?entry-class=br.edu.tcc.MotorAnalitico&parallelism=1"
+Saída esperada:
+
+json
+
+
+{"jobid":"8219b18c6027c484b202f3495b90c3ca"}
+5.3 Validação de Registro do Job
+powershell
+
+
+Invoke-RestMethod http://localhost:8081/jobs/overview
+Critério de aprovação: Localização do job Motor Analitico Epidemiologico em estado operacional RUNNING. Armazene o identificador alfanumérico retornado na variável $jobId.
+
+6. Passo 5 — Auditoria de Saúde: Checkpoints e Retenção Kafka
+Esta etapa audita os mecanismos de tolerância a falhas do pipeline, garantindo que o acúmulo de estado assíncrono não degrade a integridade do nó executor.
+
+6.1 Auditoria Quantitativa de Checkpoints
+Aguarde 180 segundos a partir do provisionamento e consulte o coordenador:
+
+powershell
+
+
+$jobId = "8219b18c6027c484b202f3495b90c3ca"
+curl.exe -sS "http://localhost:8081/jobs/$jobId/checkpoints" | ConvertFrom-Json | Select-Object -ExpandProperty counts
+Saída esperada:
+
+text
+
+
+restored    : 0<br/>
+total       : 2<br/>
+in_progress : 0<br/>
+completed   : 2<br/>
+failed      : 0
+Critério de aprovação: Valor de completed estritamente superior a zero e índice cumulativo de failed igual a zero.
+
+6.2 Monitoramento do Grupo Consumidor
+powershell
+
+
+docker exec kafka kafka-consumer-groups --bootstrap-server kafka:29092 --describe --group motor-analitico-epidemiologico-v2
+Saída esperada:
+
+text
+
+
+Consumer group 'motor-analitico-epidemiologico-v2' has no active members.
+
+GROUP                             TOPIC                                          PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
+motor-analitico-epidemiologico-v2 epidemiologia_castro.public.notificacoes       0          949             949             0
+motor-analitico-epidemiologico-v2 epidemiologia_curitiba.public.notificacoes     0          1403            1403            0
+motor-analitico-epidemiologico-v2 epidemiologia_ponta_grossa.public.notificacoes 0          1291            1291            0
+Critério de aprovação: Diferencial de retardo (LAG) estritamente igual a 0 em todas as partições. O estado has no active members é padrão e esperado para a implementação nativa de KafkaSource orientada a checkpoints do Apache Flink.
+
+7. Passo 6 — Injeção de Carga Sintética e Detecção de Surtos
+O gerador sintético injeta uma distribuição realista de notificações com coordenadas e carimbos temporais, intercalando eventos de rotina com anomalias propositais para validação dos filtros analíticos.
+
+7.1 Captura de Linha de Base dos Offsets
+Execute a medição prévia de posição absoluta nos tópicos analíticos:
+
+powershell
+
+
+docker exec kafka kafka-run-class kafka.tools.GetOffsetShell --broker-list kafka:29092 --topic epidemiologia.alertas --time -1<br/>
+docker exec kafka kafka-run-class kafka.tools.GetOffsetShell --broker-list kafka:29092 --topic epidemiologia.contagens --time -1
+Saída de referência:
+
+text
+
+
+epidemiologia.alertas:0:26148<br/>
+epidemiologia.alertas:1:24474<br/>
+epidemiologia.alertas:2:30866<br/>
+epidemiologia.contagens:0:77265
+7.2 Execução do Módulo Simulador
+powershell
+
+
+cd C:\Users\muril\Documents\TCC
+python .\simulator\gerador.py
+Saída esperada:
+
+text
+
+
+Ciclo de 300s = 24h simuladas | 3516 notificacoes (3491 de preenchimento)
+Surto planejado: 3 casos de MENINGITE em Castro (bairro ancora: CENTRO)
+
+[1/3] SURTO MENINGITE -> Castro (bairro: MOCAMINHO)<br/>
+[2/3] SURTO MENINGITE -> Castro (bairro: VILA ISA)<br/>
+[3/3] SURTO MENINGITE -> Castro (bairro: COHAB)
+
+Fim do ciclo: 3516/3516 inseridos | Surto de MENINGITE: 3/3 casos injetados em Castro
+7.3 Verificação de Gravação Transacional
+powershell
+
+
+docker exec postgres-curitiba psql -U postgres -d sinan_db -c "SELECT COUNT(*) FROM public.notificacoes;"
+Critério de aprovação: Contagem de registros superior a 4.000 linhas no banco sinan_db de Curitiba, confirmando inserção efetiva.
+
+7.4 Avaliação de Incremento no Kafka
+Reexecute a inspeção de offsets:
+
+powershell
+
+
+docker exec kafka kafka-run-class kafka.tools.GetOffsetShell --broker-list kafka:29092 --topic epidemiologia.alertas --time -1
+Saída esperada após carga:
+
+text
+
+
+epidemiologia.alertas:0:27358<br/>
+epidemiologia.alertas:1:25524<br/>
+epidemiologia.alertas:2:32123
+Critério de aprovação: Diferencial positivo estrito em relação à linha de base em todas as partições do tópico epidemiologia.alertas.
+
+7.5 Leitura Dirigida de Alertas e Validação de Formato
+Consuma os dados gerados utilizando a posição da linha de base como offset de partida:
+
+powershell
+
+
+docker exec kafka kafka-console-consumer --bootstrap-server kafka:29092 --topic epidemiologia.alertas --partition 0 --offset 26148 --timeout-ms 30000 --max-messages 5
+Estrutura JSON validada:
+
+json
+
+
+{"doenca":"POPULAR","atualizado_em":"2026-09-23T23:23:03.155288Z","municipio":"CURITIBA","bairro":"CENTRO","chave":"POPULAR|CIDADE|4106902","codigo_ibge":"4106902","tipo_agregacao":"CIDADE","quantidade_casos":1}
+7.6 Confirmação da Regra Epidemiológica do Surto
+Filtre os registros analíticos do surto induzido na partição correspondente:
+
+powershell
+
+
+docker exec kafka kafka-console-consumer --bootstrap-server kafka:29092 --topic epidemiologia.alertas --partition 0 --offset 26148 --timeout-ms 30000 --max-messages 2000 | Select-String "MENINGITE" | Select-Object -First 5
+Saída esperada:
+
+json
+
+
+{"doenca":"MENINGITE","atualizado_em":"2026-09-23T23:27:50.737859Z","municipio":"CASTRO","bairro":"COHAB","chave":"MENINGITE|CIDADE|4104153","codigo_ibge":"4104153","tipo_agregacao":"CIDADE","quantidade_casos":3}
+Critério de aprovação: Identificação de mensagem com municipio: "CASTRO", doenca: "MENINGITE" e quantidade_casos: 3, atestando a detecção exata dos 3 eventos injetados pelo simulador.
+
+8. Passo 7 — Visualização Analítica no Dashboard em Tempo Real
+A camada de apresentação compreende um serviço desacoplado que ingere eventos analíticos do Kafka via consumidor interno e disponibiliza agregados via WebSocket e endpoints HTTP REST.
+
+8.1 Inicialização do Servidor (Terminal 1)
+Abra uma janela exclusiva do PowerShell e inicialize o serviço:
+
+powershell
+
+
+cd C:\Users\muril\Documents\TCC
+python .\dashboard\server.py
+Saída esperada no console:
+
+text
+
+
+INFO:     Started server process [13828]<br/>
+INFO:     Application startup complete.<br/>
+INFO:     Uvicorn running on http://0.0.0.0:8501 (Press CTRL+C to quit)
+[Kafka] Consumer iniciado — aguardando contagens do Flink...
+8.2 Consulta à API de Estatísticas (Terminal 2)
+Em um terminal paralelo, audite o endpoint de extração:
+
+powershell
+
+
+Invoke-RestMethod http://localhost:8501/api/stats
+8.3 Interface de Usuário
+Acesse pelo navegador web o endereço http://localhost:8501.
+
+Critérios de aprovação:
+
+Disponibilidade operacional do serviço HTTP respondendo na porta 8501.
+Agrupamento estrito de municípios sob caixa única normalizada (CURITIBA, CASTRO, PONTA GROSSA), eliminando duplicatas.
+Exibição do registro de MENINGITE em Castro com contagem consolidada igual a 3.
+Atualização reativa dos componentes gráficos sem necessidade de recarregamento manual de página via WebSocket.
+9. Sumário Executivo de Validação Operacional (23/09/2026)
+A execução consolidada em 23 de setembro de 2026 homologou a robustez da arquitetura de fluxo contínuo implementada, comprovando sua viabilidade técnica para observabilidade em saúde pública.
+
+Parâmetro de Auditoria	Comportamento Anterior (Job Legado)	Resultado Homologado (Motor v2)
+Estratégia de Janelamento	SlidingEventTimeWindows (24h/5min)	KeyedProcessFunction com Retenção de Estado
+Estabilidade de Checkpoints	137 falhas consecutivas em 158 disparos	33 checkpoints concluídos com sucesso (0 falhas)
+Tamanho de Estado Serializado	~24 MB (estouro do limite de memória de 5 MB)	< 500 KB (compatível com retenção em memória)
+Vazão sob Carga Agrupada	Operadores reiniciados em loop (attempt 161+)	3.516 eventos absorvidos sem backpressure
+Retardo de Consumo (Kafka LAG)	Acúmulo de 660 mensagens represadas	LAG 0 em todos os tópicos particionados
+Normalização Territorial	Entradas divergentes ("Curitiba" vs "CURITIBA")	Padronização consistente via toUpperCase()
+Sensibilidade a Surtos	Indeterminado por travamento do grafo analítico	Detecção exata de surto (3 casos de Meningite)
+10. Guia Rápido de Solução de Problemas (Troubleshooting)
+Catálogo de comportamentos anômalos comuns durante o ciclo de implantação e seus respectivos planos de contenção imediata.
+
+10.1 Falha de Comunicação com Daemon Docker (npipe)
+Sintoma: failed to connect to the docker API at npipe:////./pipe/dockerDesktopLinuxEngine.
+Causa: Processo em segundo plano do Docker Desktop inativo ou motor WSL 2 finalizado.
+Ação Corretiva: Inicie o Docker Desktop pelo atalho do sistema e execute repetidamente docker version até que o bloco Server seja reportado.
+10.2 Conector Legado em Estado Falho (sinan-postgres-connector)
+Sintoma: Verificação do Debezium reporta sinan-postgres-connector -> RUNNING | tasks: FAILED.
+Causa: Resquício de metadados buscando a instância extinta postgres-legado.
+Ação Corretiva: Inofensivo para a execução atual. Caso deseje limpar o conector do catálogo, execute: curl.exe -X DELETE http://localhost:8083/connectors/sinan-postgres-connector.
+10.3 Falha de Checkpoint Assíncrono (Asynchronous task checkpoint failed)
+Sintoma: Consulta ao Flink indica status: FAILED e mensagem Size of the state is larger than the maximum permitted memory-backed state.
+Causa: Utilização de MemoryStateBackend padrão com estado cumulativo excedendo o teto de 5.242.880 bytes (5 MB).
+Ação Corretiva: A migração para KeyedProcessFunction suprime este problema por manter o estado compacto. Para volumes de produção, configure persistência externa via FileSystemCheckpointStorage("file:///opt/flink/checkpoints") com montagem de volume mapeado entre JobManager e TaskManager no docker-compose.yml.
+10.4 Erro de Conexão na Consulta REST do Dashboard
+Sintoma: Invoke-RestMethod : Impossível conectar-se ao servidor remoto na porta 8000.
+Causa: Mapeamento de porta incorreto na chamada ou ausência de inicialização do processo.
+Ação Corretiva: O backend analítico server.py utiliza nativamente a porta 8501. Assegure que o Terminal 1 esteja com o Uvicorn ativo e aponte as requisições para http://localhost:8501/api/stats.
+10.5 Consumidor Kafka Retorna Zero Mensagens com Timeout
+Sintoma: Processed a total of 0 messages acompanhado de TimeoutException.
+Causa: Utilização de auto.offset.reset=latest em tópicos cujas mensagens foram propagadas antes do início da escuta do consumidor.
+Ação Corretiva: Realize o consumo direcionado via --partition e atribuição manual do --offset base anotado antes da injeção de dados.
+10.6 Comando Maven Não Reconhecido no Shell
+Sintoma: mvn : O termo 'mvn' não é reconhecido como nome de cmdlet.
+Causa: Ausência de variáveis de ambiente do Apache Maven ou JDK configuradas no hospedeiro.
+Ação Corretiva: Não instale dependências manuais no sistema operacional hospedeiro. Utilize estritamente o contêiner efêmero de compilação fornecido no Passo 3 (docker run ... maven:3.9-eclipse-temurin-17).
