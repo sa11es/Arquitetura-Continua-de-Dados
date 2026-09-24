@@ -1,265 +1,152 @@
-import argparse
-import csv
-from datetime import date, datetime, timedelta
-import os
-import random
+# -*- coding: utf-8 -*-
+"""
+Simulador Epidemiológico — ciclo comprimido
+5 minutos de execução = 24 horas simuladas.
+Gera a média diária de notificações por cidade/doença
+e injeta 1 surto garantido no último minuto.
+Uso: python simulador_surto.py [dengue|meningite|influenza|aleatorio]
+"""
+import sys
 import time
-from psycopg2.extras import execute_values
+import random
+from datetime import datetime
 import psycopg2
 
-DB_USER = "postgres"
-DB_PASS = "postgrespassword"
-DB_NAME = "sinan_db"
+# ===================== CONFIG =====================
+CICLO_SEGUNDOS   = 300      # 5 min = 24h simuladas
+FIM_BASE         = 240      # casos "do dia" distribuídos até aqui
+FATOR_CARGA      = 1.0      # reduza p/ 0.5 se Debezium não acompanhar o volume
+SEED             = 42       # fixa = rodadas reproduzíveis; None = aleatório
 
-BANCOS = [
-    {
-        "cidade": "Ponta Grossa",
-        "codigo_ibge": "4119905",
-        "host": "localhost",
-        "port": "5433",
-        "bairros": [
-            "Centro",
-            "Estrela",
-            "Oficinas",
-            "Uvaranas",
-            "Nova Rússia",
-            "Contorno",
-            "Jardim Carvalho",
-            "Órfãs",
-            "Neves",
-            "Boa Vista",
-            "Chapada",
-            "Ronda",
-        ],
-    },
-    {
-        "cidade": "Curitiba",
-        "codigo_ibge": "4106902",
-        "host": "localhost",
-        "port": "5434",
-        "bairros": [
-            "Centro",
-            "Água Verde",
-            "Batel",
-            "Champagnat",
-            "Santa Felicidade",
-            "Cabral",
-            "Portão",
-            "Cajuru",
-            "Boqueirão",
-            "Tatuquara",
-            "Pinheirinho",
-            "Sítio Cercado",
-        ],
-    },
-    {
-        "cidade": "Castro",
-        "codigo_ibge": "4104907",
-        "host": "localhost",
-        "port": "5435",
-        "bairros": [
-            "Centro",
-            "Invernada",
-            "Cantagalo",
-            "Jardim das Araucárias",
-            "Vila Rio Branco",
-            "Morada do Sol",
-            "Jardim Social",
-            "Lacustre",
-            "Termas de Riviera",
-            "Castrolanda",
-            "Abapan",
-            "Socavão",
-        ],
-    },
-]
+DB_CONFIGS = {
+    "Ponta Grossa": {"port": 5433, "ibge": "4119905"},
+    "Curitiba":     {"port": 5434, "ibge": "4106902"},
+    "Castro":       {"port": 5435, "ibge": "4104153"},  # conferir IBGE (4104907 no script antigo)
+}
+DB_USER, DB_PASS, DB_NAME, DB_HOST = "postgres", "postgrespassword", "sinan_db", "localhost"
 
-DOENCAS = {"DENGUE": "A90", "MENINGITE": "G03.9", "INFLUENZA": "J11"}
+# Média diária: total da cidade + alvos monitorados (resto = POPULAR)
+TAXAS = {
+    "Ponta Grossa": {"total": 372,  "DENGUE": 0.37, "MENINGITE": 0.34, "INFLUENZA": 3.12},
+    "Curitiba":     {"total": 2979, "DENGUE": 0.80, "MENINGITE": 0.57, "INFLUENZA": 16.0},
+    "Castro":       {"total": 162,  "DENGUE": 0.03, "MENINGITE": 0.005, "INFLUENZA": 0.12},
+}
 
+CID10      = {"DENGUE": "A90", "MENINGITE": "A39", "INFLUENZA": "J11"}
+CID_POPULAR = ["A09", "J18", "K04"]   # gastroenterite, pneumonia, odontológico
 
-def gerar_lote(banco, quantidade):
-  """Gera uma lista de tuplas para inserção em batch."""
-  lote = []
-  for _ in range(quantidade):
-    dt_sintomas = date.today() - timedelta(days=random.randint(1, 15))
-    bairro = random.choice(banco["bairros"])
-    doenca = random.choice(list(DOENCAS.keys()))
-    cid_10 = DOENCAS[doenca]
-    idade = random.randint(5, 80)
-    sexo = random.choice(["M", "F", "I"])
-    lote.append((
-        dt_sintomas,
-        banco["cidade"],
-        banco["codigo_ibge"],
-        bairro,
-        doenca,
-        cid_10,
-        idade,
-        sexo,
-    ))
-  return lote
+BAIRROS = {
+    "Ponta Grossa": ["CENTRO", "OFICINAS", "UVARANAS", "NOVA RUSSIA", "CARLOS CARVALHO"],
+    "Curitiba":     ["CENTRO", "BATEL", "BOQUEIRAO", "SITIO CERCADO", "PINHEIRINHO"],
+    "Castro":       ["CENTRO", "COHAB", "VILA ISA", "MOCAMINHO"],
+}
 
+# Mínimos que GARANTEM o disparo do alerta
+SURTO = {
+    "MENINGITE": {"n": 3,  "bairro_fixo": False},
+    "DENGUE":    {"n": 6,  "bairro_fixo": False},   # 6 na cidade cobre a regra
+    "INFLUENZA": {"n": 20, "bairro_fixo": True},    # 20 no mesmo bairro cobre a regra
+}
+
+# ===================== HELPERS =====================
+def sortear(qtd_media):
+    """Converte média diária fracionária em nº de casos do ciclo."""
+    if qtd_media < 1:
+        return 1 if random.random() < qtd_media else 0
+    n = int(qtd_media)
+    return n + (1 if random.random() < (qtd_media - n) else 0)
+
+def montar_agenda():
+    agenda = []
+    for cidade, tx in TAXAS.items():
+        n_deng = sortear(tx["DENGUE"])
+        n_men  = sortear(tx["MENINGITE"])
+        n_inf  = sortear(tx["INFLUENZA"])
+        n_pop  = max(0, tx["total"] - n_deng - n_men - n_inf)
+
+        plano = ([("DENGUE", CID10["DENGUE"])] * n_deng +
+                 [("MENINGITE", CID10["MENINGITE"])] * n_men +
+                 [("INFLUENZA", CID10["INFLUENZA"])] * n_inf +
+                 [("POPULAR", random.choice(CID_POPULAR))] * n_pop)
+
+        for doenca, cid in plano:
+            agenda.append((random.uniform(0, FIM_BASE), cidade, doenca, cid,
+                           random.choice(BAIRROS[cidade])))
+
+    # ---------- SURTO GARANTIDO (último minuto) ----------
+    escolha = sys.argv[1].upper() if len(sys.argv) > 1 else "ALEATORIO"
+    doenca_surto = (escolha if escolha in SURTO
+                    else random.choice(list(SURTO.keys())))
+    cidade_surto = random.choice(list(TAXAS.keys()))
+    bairro_base  = random.choice(BAIRROS[cidade_surto])
+    regra = SURTO[doenca_surto]
+
+    for _ in range(regra["n"]):
+        t = random.uniform(FIM_BASE + 2, CICLO_SEGUNDOS - 1)
+        bairro = bairro_base if regra["bairro_fixo"] else random.choice(BAIRROS[cidade_surto])
+        agenda.append((t, cidade_surto, doenca_surto, CID10[doenca_surto], bairro))
+
+    agenda.sort(key=lambda e: e[0])
+    return agenda, (doenca_surto, cidade_surto, bairro_base, regra["n"])
+
+# ===================== BANCO =====================
+SQL = """INSERT INTO public.notificacoes
+ (municipio_residencia, codigo_ibge, bairro, doenca, cid_10,
+  dt_notificacao, dt_sintomas, idade, sexo, status_caso)
+ VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'SUSPEITO');"""
 
 def abrir_conexoes():
-  """Abre conexões persistentes para os 3 bancos."""
-  conexoes = {}
-  for banco in BANCOS:
-    conn = psycopg2.connect(
-        host=banco["host"],
-        port=banco["port"],
-        database=DB_NAME,
-        user=DB_USER,
-        password=DB_PASS,
-    )
-    conn.autocommit = False
-    conexoes[banco["cidade"]] = conn
-    print(
-        f"✅ Conexão estabelecida: {banco['cidade']}"
-        f" ({banco['host']}:{banco['port']})"
-    )
-  return conexoes
+    return {c: psycopg2.connect(host=DB_HOST, port=cfg["port"], user=DB_USER,
+                                password=DB_PASS, dbname=DB_NAME)
+            for c, cfg in DB_CONFIGS.items()}
 
-
-def inserir_lote(conexao, banco, lote):
-  """Insere um lote de notificações usando execute_values (batch insert)."""
-  cursor = conexao.cursor()
-  query = """
-        INSERT INTO notificacoes
-        (dt_sintomas, municipio_residencia, codigo_ibge,
-         bairro, doenca, cid_10, idade, sexo)
-        VALUES %s
-    """
-  execute_values(cursor, query, lote)
-  conexao.commit()
-  cursor.close()
-
-
-def run(rps, duracao_segundos, arquivo_csv):
-  # Garante que o arquivo seja salvo na mesma pasta onde o script está localizado
-  if not os.path.isabs(arquivo_csv):
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    arquivo_csv = os.path.join(script_dir, arquivo_csv)
-
-  print(f"\n{'='*60}")
-  print("  GERADOR DE CARGA EPIDEMIOLÓGICA")
-  print(f"  Taxa alvo: {rps} inserções/segundo")
-  print(f"  Duração: {duracao_segundos} segundos")
-  print(f"  Total estimado: {rps * duracao_segundos} notificações")
-  print(f"  Arquivo de métricas: {arquivo_csv}")
-  print(f"{'='*60}\n")
-
-  conexoes = abrir_conexoes()
-  total_inserido = 0
-  segundo = 0
-
-  # Abre o arquivo em modo "w" para SOBRESCREVER qualquer versão anterior
-  with open(arquivo_csv, "w", newline="", encoding="utf-8") as f:
-    writer = csv.writer(f)
-    writer.writerow([
-        "timestamp_iso",
-        "timestamp_epoch",
-        "segundo",
-        "cidade",
-        "registros_inseridos",
-        "tempo_insercao_ms",
-        "rps_real",
-    ])
-    f.flush()
-
-    print("Iniciando geração de carga... Pressione CTRL+C para parar.\n")
-
+def inserir(conn, cidade, doenca, cid, bairro, quando):
+    cfg = DB_CONFIGS[cidade]
     try:
-      for segundo in range(1, duracao_segundos + 1):
-        inicio_ciclo = time.time()
-        timestamp_iso = datetime.now().isoformat()
-        timestamp_epoch = int(inicio_ciclo)
+        with conn.cursor() as cur:
+            cur.execute(SQL, (cidade, cfg["ibge"], bairro, doenca, cid,
+                              quando, quando.date(), random.randint(1, 90),
+                              random.choice("MFI")))
+        conn.commit()
+        return True
+    except Exception as e:
+        conn.rollback()
+        print(f"❌ {cidade}: {e}")
+        return False
 
-        # Distribui o RPS entre os 3 bancos
-        registros_por_banco = max(1, rps // 3)
-        resto = rps - (registros_por_banco * 3)
+# ===================== MAIN =====================
+def main():
+    if SEED is not None:
+        random.seed(SEED)
 
-        for i, banco in enumerate(BANCOS):
-          qtd = registros_por_banco + (1 if i < resto else 0)
-          lote = gerar_lote(banco, qtd)
+    agenda, (doenca_s, cidade_s, bairro_s, n_s) = montar_agenda()
+    total_pop = sum(1 for e in agenda if e[2] == "POPULAR")
+    print(f"🚀 Ciclo de {CICLO_SEGUNDOS}s = 24h simuladas | {len(agenda)} notificações "
+          f"({total_pop} de preenchimento)")
+    print(f"🚨 Surto planejado: {n_s} casos de {doenca_s} em {cidade_s} "
+          f"(bairro âncora: {bairro_s})\n")
 
-          t0 = time.time()
-          inserir_lote(conexoes[banco["cidade"]], banco, lote)
-          t1 = time.time()
-
-          tempo_ms = round((t1 - t0) * 1000, 2)
-          total_inserido += qtd
-
-          # Escreve a linha usando o manipulador de arquivo já aberto
-          writer.writerow([
-              timestamp_iso,
-              timestamp_epoch,
-              segundo,
-              banco["cidade"],
-              qtd,
-              tempo_ms,
-              round(qtd / (t1 - t0), 2) if t1 > t0 else 0,
-          ])
-
-        f.flush()  # Garante a gravação no disco a cada ciclo
-
-        # Calcula tempo decorrido e ajusta o sleep
-        tempo_gasto = time.time() - inicio_ciclo
-        sleep_restante = max(0, 1.0 - tempo_gasto)
-        rps_real = round(rps / max(tempo_gasto, 0.001), 1)
-
-        print(
-            f"[{segundo:3d}s] Inseridos: {rps} | "
-            f"Total: {total_inserido} | "
-            f"Tempo ciclo: {round(tempo_gasto*1000)}ms | "
-            f"RPS real: {rps_real} | "
-            f"Sleep: {round(sleep_restante*1000)}ms"
-        )
-
-        if sleep_restante > 0:
-          time.sleep(sleep_restante)
-
+    conns = abrir_conexoes()
+    t0 = time.time()
+    ok = surto_ok = 0
+    try:
+        for t, cidade, doenca, cid, bairro in agenda:
+            atraso = t0 + t - time.time()
+            if atraso > 0:
+                time.sleep(atraso)
+            if inserir(conns[cidade], cidade, doenca, cid, bairro, datetime.now()):
+                ok += 1
+                if doenca == doenca_s and cidade == cidade_s:
+                    surto_ok += 1
+                    print(f"🚨 [{surto_ok}/{n_s}] SURTO {doenca_s} → {cidade_s} "
+                          f"(bairro: {bairro})")
     except KeyboardInterrupt:
-      print("\n⚠ Geração interrompida pelo usuário.")
-
+        print("\n🛑 Interrompido pelo usuário.")
     finally:
-      for cidade, conn in conexoes.items():
-        conn.close()
-        print(f"🔌 Conexão fechada: {cidade}")
-
-  print(f"\n{'='*60}")
-  print("  RESUMO DA CARGA")
-  print(f"  Total inserido: {total_inserido} notificações")
-  print(f"  Duração: {segundo} segundos")
-  print(
-      f"  RPS médio:"
-      f" {round(total_inserido / segundo, 1) if segundo > 0 else 0}"
-  )
-  print(f"  Métricas salvas em: {arquivo_csv}")
-  print(f"{'='*60}")
-
+        for c in conns.values():
+            c.close()
+    print(f"\n✅ Fim do ciclo: {ok}/{len(agenda)} inseridos | "
+          f"Surto de {doenca_s}: {surto_ok}/{n_s} casos injetados em {cidade_s}")
 
 if __name__ == "__main__":
-  parser = argparse.ArgumentParser(
-      description="Gerador de carga epidemiológica"
-  )
-  parser.add_argument(
-      "--rps",
-      type=int,
-      default=20,
-      help="Inserções por segundo (default: 20)",
-  )
-  parser.add_argument(
-      "--duracao",
-      type=int,
-      default=60,
-      help="Duração em segundos (default: 60)",
-  )
-  parser.add_argument(
-      "--csv",
-      type=str,
-      default="carga_inserts.csv",
-      help="Arquivo CSV de saída (default: carga_inserts.csv)",
-  )
-  args = parser.parse_args()
-
-  run(args.rps, args.duracao, args.csv)
+    main()
