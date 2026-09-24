@@ -4,7 +4,11 @@ Simulador Epidemiológico — ciclo comprimido
 5 minutos de execução = 24 horas simuladas.
 Gera a média diária de notificações por cidade/doença
 e injeta 1 surto garantido no último minuto.
-Uso: python simulador_surto.py [dengue|meningite|influenza|aleatorio]
+
+Uso:
+  python gerador.py                  # surto aleatório (doença, cidade e bairro)
+  python gerador.py dengue           # surto garantido de dengue, resto sorteado
+  python gerador.py --seed 42        # rodada reproduzível
 """
 import sys
 import time
@@ -16,7 +20,7 @@ import psycopg2
 CICLO_SEGUNDOS   = 300      # 5 min = 24h simuladas
 FIM_BASE         = 240      # casos "do dia" distribuídos até aqui
 FATOR_CARGA      = 1.0      # reduza p/ 0.5 se Debezium não acompanhar o volume
-SEED             = 42       # fixa = rodadas reproduzíveis; None = aleatório
+SEED             = None     # None = surto sorteado a cada execução
 
 DB_CONFIGS = {
     "Ponta Grossa": {"port": 5433, "ibge": "4119905"},
@@ -56,7 +60,7 @@ def sortear(qtd_media):
     n = int(qtd_media)
     return n + (1 if random.random() < (qtd_media - n) else 0)
 
-def montar_agenda():
+def montar_agenda(doenca_forcada=None):
     agenda = []
     for cidade, tx in TAXAS.items():
         n_deng = sortear(tx["DENGUE"])
@@ -74,8 +78,7 @@ def montar_agenda():
                            random.choice(BAIRROS[cidade])))
 
     # ---------- SURTO GARANTIDO (último minuto) ----------
-    escolha = sys.argv[1].upper() if len(sys.argv) > 1 else "ALEATORIO"
-    doenca_surto = (escolha if escolha in SURTO
+    doenca_surto = (doenca_forcada if doenca_forcada in SURTO
                     else random.choice(list(SURTO.keys())))
     cidade_surto = random.choice(list(TAXAS.keys()))
     bairro_base  = random.choice(BAIRROS[cidade_surto])
@@ -116,10 +119,33 @@ def inserir(conn, cidade, doenca, cid, bairro, quando):
 
 # ===================== MAIN =====================
 def main():
-    if SEED is not None:
-        random.seed(SEED)
+    args = sys.argv[1:]
 
-    agenda, (doenca_s, cidade_s, bairro_s, n_s) = montar_agenda()
+    # --seed N  -> rodada reproduzível
+    seed = SEED
+    if "--seed" in args:
+        try:
+            seed = int(args[args.index("--seed") + 1])
+        except (IndexError, ValueError):
+            print("Uso incorreto de --seed. Ex: python gerador.py --seed 42")
+            sys.exit(1)
+        idx = args.index("--seed")
+        args = args[:idx] + args[idx + 2:]
+
+    # argumento posicional opcional: nome da doença do surto
+    doenca_forcada = None
+    if args:
+        candidato = args[0].upper()
+        if candidato in SURTO:
+            doenca_forcada = candidato
+        else:
+            print(f"Doença '{candidato}' não reconhecida. Opções: {', '.join(SURTO.keys())}")
+            sys.exit(1)
+
+    if seed is not None:
+        random.seed(seed)
+
+    agenda, (doenca_s, cidade_s, bairro_s, n_s) = montar_agenda(doenca_forcada)
     total_pop = sum(1 for e in agenda if e[2] == "POPULAR")
     print(f"🚀 Ciclo de {CICLO_SEGUNDOS}s = 24h simuladas | {len(agenda)} notificações "
           f"({total_pop} de preenchimento)")

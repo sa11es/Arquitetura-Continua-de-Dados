@@ -17,7 +17,8 @@
             📊 Painel Epidemiológico (Flink + Kafka)
           </h1>
           <p class="text-xs text-slate-400">
-            Agregação dinâmica de casos em janelas de 24h
+            Contagem da rodada em tempo real · Surtos avaliados por dia de 5
+            minutos
           </p>
         </div>
         <div
@@ -28,12 +29,33 @@
         </div>
       </header>
 
+      <!-- BLOCO DE SURTOS ATIVOS -->
+      <div
+        id="secao-surtos"
+        class="bg-slate-800 rounded-xl border border-slate-600 overflow-hidden hidden"
+      >
+        <div
+          class="p-4 border-b border-slate-700 font-bold text-slate-200 flex items-center gap-2"
+        >
+          🚨 Surtos Ativos (dia atual de 5 min)
+          <span
+            id="badge-surtos"
+            class="px-2 py-0.5 text-xs rounded-full bg-slate-700 text-slate-200"
+            >0</span
+          >
+        </div>
+        <div
+          id="cards-surtos"
+          class="p-4 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4"
+        ></div>
+      </div>
+
       <!-- CARDS DE ESTATÍSTICAS -->
       <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
         <div class="bg-slate-800 p-5 rounded-xl border border-slate-700">
           <span
             class="text-xs font-medium text-slate-400 uppercase tracking-wider"
-            >Total de Casos (Janela 24h)</span
+            >Total de Casos (Rodada)</span
           >
           <div id="stat-total" class="text-3xl font-bold text-sky-400 mt-2">
             0
@@ -76,13 +98,14 @@
                 <th class="p-3">Município</th>
                 <th class="p-3">Bairro / Escopo</th>
                 <th class="p-3">Casos Acumulados</th>
+                <th class="p-3">Casos no Dia (5 min)</th>
                 <th class="p-3">Fim da Janela</th>
                 <th class="p-3">Recebido às</th>
               </tr>
             </thead>
             <tbody id="tabela-feed" class="divide-y divide-slate-700/50">
               <tr>
-                <td colspan="6" class="p-4 text-center text-slate-500 italic">
+                <td colspan="7" class="p-4 text-center text-slate-500 italic">
                   Nenhuma atualização recebida até o momento.
                 </td>
               </tr>
@@ -99,8 +122,22 @@
       const statCidades = document.getElementById("stat-cidades");
       const statDoencas = document.getElementById("stat-doencas");
       const tabelaFeed = document.getElementById("tabela-feed");
+      const secaoSurtos = document.getElementById("secao-surtos");
+      const cardsSurtos = document.getElementById("cards-surtos");
+      const badgeSurtos = document.getElementById("badge-surtos");
 
       let historicoContagens = [];
+      const cacheSurtos = {};
+
+      // Formata HH:MM a partir de uma string ISO
+      function hora(iso) {
+        return iso
+          ? new Date(iso).toLocaleTimeString([], {
+              hour: "2-digit",
+              minute: "2-digit",
+            })
+          : "-";
+      }
 
       ws.onopen = () => {
         statusEl.textContent = "● Ao Vivo";
@@ -124,8 +161,37 @@
         } else if (msg.tipo === "historico") {
           historicoContagens = msg.dados;
           renderizarFeed();
+        } else if (msg.tipo === "surto") {
+          atualizarSurto(msg.dados);
+        } else if (msg.tipo === "surtos") {
+          // Lista completa dos surtos ativos: substitui o cache
+          // (surtos de dias anteriores somem quando o servidor os expira)
+          for (const k in cacheSurtos) delete cacheSurtos[k];
+          for (const s of msg.dados || []) {
+            cacheSurtos[`${s.doenca}|${s.codigo_ibge}|${s.bairro || ""}`] = s;
+          }
+          renderizarSurtos(Object.values(cacheSurtos));
+        } else if (msg.tipo === "reset") {
+          zerarTela();
         }
       };
+
+      function zerarTela() {
+        historicoContagens = [];
+        for (const k in cacheSurtos) delete cacheSurtos[k];
+        renderizarSurtos([]);
+        tabelaFeed.innerHTML = `
+          <tr>
+            <td colspan="7" class="p-4 text-center text-slate-500 italic">
+              Nenhuma atualização recebida até o momento.
+            </td>
+          </tr>`;
+        statTotal.textContent = "0";
+        statCidades.innerHTML =
+          '<span class="text-slate-500 italic">Aguardando dados...</span>';
+        statDoencas.innerHTML =
+          '<span class="text-slate-500 italic">Aguardando dados...</span>';
+      }
 
       function atualizarEstatisticas(stats) {
         statTotal.textContent = stats.total_casos || 0;
@@ -174,11 +240,55 @@
                     <td class="p-3">${item.municipio || "-"}</td>
                     <td class="p-3 text-slate-400">${item.bairro || "TODOS"}</td>
                     <td class="p-3 font-bold text-amber-400 text-base">${item.quantidade_casos}</td>
+                    <td class="p-3 font-bold text-emerald-400 text-base">${item.casos_dia ?? "-"}</td>
                     <td class="p-3 text-xs text-slate-400">${item.janela_fim || "-"}</td>
                     <td class="p-3 text-xs text-slate-500">${item.recebido_em ? new Date(item.recebido_em).toLocaleTimeString() : "-"}</td>
                 </tr>
             `,
           )
+          .join("");
+      }
+
+      // ===================== SURTOS =====================
+      const CORES_GRAVIDADE = {
+        MODERADA: "bg-yellow-500/10 border-yellow-500/60 text-yellow-300",
+        ALTA: "bg-orange-500/10 border-orange-500/60 text-orange-300",
+        CRITICO: "bg-rose-950/70 border-rose-700 text-rose-200",
+      };
+
+      function atualizarSurto(surto) {
+        if (!surto) return;
+        const chave = `${surto.doenca}|${surto.codigo_ibge}|${surto.bairro || ""}`;
+        cacheSurtos[chave] = surto;
+        renderizarSurtos(Object.values(cacheSurtos));
+      }
+
+      function renderizarSurtos(surtos) {
+        if (!surtos || surtos.length === 0) {
+          secaoSurtos.classList.add("hidden");
+          badgeSurtos.textContent = "0";
+          cardsSurtos.innerHTML = "";
+          return;
+        }
+        secaoSurtos.classList.remove("hidden");
+        badgeSurtos.textContent = surtos.length;
+        cardsSurtos.innerHTML = surtos
+          .map((s) => {
+            const cor =
+              CORES_GRAVIDADE[s.gravidade] || CORES_GRAVIDADE.MODERADA;
+            return `
+              <div class="p-4 rounded-xl border ${cor}">
+                <div class="flex justify-between items-start">
+                  <span class="text-xs font-bold uppercase tracking-wider">${s.gravidade}</span>
+                  <span class="text-xs opacity-70">${s.detectado_em ? new Date(s.detectado_em).toLocaleTimeString() : "-"}</span>
+                </div>
+                <div class="text-lg font-bold mt-2">${s.doenca}</div>
+                <div class="text-sm mt-1">📍 ${s.municipio}${s.bairro ? ` — ${s.bairro}` : ""}</div>
+                <div class="text-3xl font-extrabold mt-2">${s.casos} <span class="text-sm font-normal">casos no dia</span></div>
+                <div class="text-xs mt-2 opacity-80">Limiar: ${s.limiar} casos / dia de 5 min</div>
+                <div class="text-xs mt-1 opacity-60">Janela: ${hora(s.janela_inicio)} – ${hora(s.janela_fim)}</div>
+              </div>`;
+          })
           .join("");
       }
     </script>
