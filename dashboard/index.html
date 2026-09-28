@@ -17,8 +17,7 @@
             📊 Painel Epidemiológico (Flink + Kafka)
           </h1>
           <p class="text-xs text-slate-400">
-            Contagem da rodada em tempo real · Surtos avaliados por dia de 5
-            minutos
+            Contagem de casos da rodada em tempo real
           </p>
         </div>
         <div
@@ -29,28 +28,7 @@
         </div>
       </header>
 
-      <!-- BLOCO DE SURTOS ATIVOS -->
-      <div
-        id="secao-surtos"
-        class="bg-slate-800 rounded-xl border border-slate-600 overflow-hidden hidden"
-      >
-        <div
-          class="p-4 border-b border-slate-700 font-bold text-slate-200 flex items-center gap-2"
-        >
-          🚨 Surtos Ativos (dia atual de 5 min)
-          <span
-            id="badge-surtos"
-            class="px-2 py-0.5 text-xs rounded-full bg-slate-700 text-slate-200"
-            >0</span
-          >
-        </div>
-        <div
-          id="cards-surtos"
-          class="p-4 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4"
-        ></div>
-      </div>
-
-      <!-- CARDS DE ESTATÍSTICAS -->
+      <!-- RESUMO GERAL: TOTAL + CASOS POR AGRAVO -->
       <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
         <div class="bg-slate-800 p-5 rounded-xl border border-slate-700">
           <span
@@ -61,24 +39,32 @@
             0
           </div>
         </div>
-        <div class="bg-slate-800 p-5 rounded-xl border border-slate-700">
+        <div
+          class="bg-slate-800 p-5 rounded-xl border border-slate-700 md:col-span-2"
+        >
           <span
             class="text-xs font-medium text-slate-400 uppercase tracking-wider"
-            >Casos por Município</span
+            >Casos por Agravo/Doença (todos os municípios)</span
           >
-          <div id="stat-cidades" class="text-sm space-y-1 mt-2 text-slate-300">
-            <span class="text-slate-500 italic">Aguardando dados...</span>
+          <div id="stat-doencas" class="flex flex-wrap gap-2 mt-3">
+            <span class="text-sm text-slate-500 italic"
+              >Aguardando dados...</span
+            >
           </div>
         </div>
-        <div class="bg-slate-800 p-5 rounded-xl border border-slate-700">
-          <span
-            class="text-xs font-medium text-slate-400 uppercase tracking-wider"
-            >Casos por Agravo/Doença</span
-          >
-          <div id="stat-doencas" class="text-sm space-y-1 mt-2 text-slate-300">
-            <span class="text-slate-500 italic">Aguardando dados...</span>
-          </div>
-        </div>
+      </div>
+
+      <!-- CARDS POR MUNICÍPIO -->
+      <div>
+        <h2
+          class="text-xs font-medium text-slate-400 uppercase tracking-wider mb-3"
+        >
+          🏙️ Casos por Município
+        </h2>
+        <div
+          id="cards-cidades"
+          class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4"
+        ></div>
       </div>
 
       <!-- TABELA DE ATUALIZAÇÕES EM TEMPO REAL -->
@@ -98,14 +84,12 @@
                 <th class="p-3">Município</th>
                 <th class="p-3">Bairro / Escopo</th>
                 <th class="p-3">Casos Acumulados</th>
-                <th class="p-3">Casos no Dia (5 min)</th>
-                <th class="p-3">Fim da Janela</th>
                 <th class="p-3">Recebido às</th>
               </tr>
             </thead>
             <tbody id="tabela-feed" class="divide-y divide-slate-700/50">
               <tr>
-                <td colspan="7" class="p-4 text-center text-slate-500 italic">
+                <td colspan="5" class="p-4 text-center text-slate-500 italic">
                   Nenhuma atualização recebida até o momento.
                 </td>
               </tr>
@@ -119,24 +103,17 @@
       const ws = new WebSocket(`ws://${window.location.host}/ws`);
       const statusEl = document.getElementById("status-conexao");
       const statTotal = document.getElementById("stat-total");
-      const statCidades = document.getElementById("stat-cidades");
       const statDoencas = document.getElementById("stat-doencas");
+      const cardsCidades = document.getElementById("cards-cidades");
       const tabelaFeed = document.getElementById("tabela-feed");
-      const secaoSurtos = document.getElementById("secao-surtos");
-      const cardsSurtos = document.getElementById("cards-surtos");
-      const badgeSurtos = document.getElementById("badge-surtos");
 
       let historicoContagens = [];
-      const cacheSurtos = {};
 
-      // Formata HH:MM a partir de uma string ISO
-      function hora(iso) {
-        return iso
-          ? new Date(iso).toLocaleTimeString([], {
-              hour: "2-digit",
-              minute: "2-digit",
-            })
-          : "-";
+      // "PONTA GROSSA" -> "Ponta Grossa"
+      function titulo(txt) {
+        return (txt || "-")
+          .toLowerCase()
+          .replace(/(^|\s)\S/g, (letra) => letra.toUpperCase());
       }
 
       ws.onopen = () => {
@@ -161,16 +138,6 @@
         } else if (msg.tipo === "historico") {
           historicoContagens = msg.dados;
           renderizarFeed();
-        } else if (msg.tipo === "surto") {
-          atualizarSurto(msg.dados);
-        } else if (msg.tipo === "surtos") {
-          // Lista completa dos surtos ativos: substitui o cache
-          // (surtos de dias anteriores somem quando o servidor os expira)
-          for (const k in cacheSurtos) delete cacheSurtos[k];
-          for (const s of msg.dados || []) {
-            cacheSurtos[`${s.doenca}|${s.codigo_ibge}|${s.bairro || ""}`] = s;
-          }
-          renderizarSurtos(Object.values(cacheSurtos));
         } else if (msg.tipo === "reset") {
           zerarTela();
         }
@@ -178,51 +145,103 @@
 
       function zerarTela() {
         historicoContagens = [];
-        for (const k in cacheSurtos) delete cacheSurtos[k];
-        renderizarSurtos([]);
         tabelaFeed.innerHTML = `
           <tr>
-            <td colspan="7" class="p-4 text-center text-slate-500 italic">
+            <td colspan="5" class="p-4 text-center text-slate-500 italic">
               Nenhuma atualização recebida até o momento.
             </td>
           </tr>`;
         statTotal.textContent = "0";
-        statCidades.innerHTML =
-          '<span class="text-slate-500 italic">Aguardando dados...</span>';
-        statDoencas.innerHTML =
-          '<span class="text-slate-500 italic">Aguardando dados...</span>';
+        // Os cards de município e os chips de agravo são redesenhados
+        // pela mensagem "stats" que o servidor envia logo após o reset.
       }
+
+      // ===================== ESTATÍSTICAS / CARDS =====================
+      // Cores por doença (as demais, ex.: POPULAR, usam a cor padrão).
+      const COR_DOENCA = {
+        DENGUE: { dot: "bg-amber-400" },
+        MENINGITE: { dot: "bg-rose-400" },
+        INFLUENZA: { dot: "bg-sky-400" },
+      };
+      const COR_PADRAO = { dot: "bg-slate-400" };
 
       function atualizarEstatisticas(stats) {
         statTotal.textContent = stats.total_casos || 0;
-
-        // Renderiza Casos por Cidade
-        if (
-          stats.casos_por_cidade &&
-          Object.keys(stats.casos_por_cidade).length > 0
-        ) {
-          statCidades.innerHTML = Object.entries(stats.casos_por_cidade)
-            .map(
-              ([cidade, qtd]) =>
-                `<div class="flex justify-between"><span>${cidade}:</span><b class="text-sky-400">${qtd}</b></div>`,
-            )
-            .join("");
-        }
-
-        // Renderiza Casos por Doença
-        if (
-          stats.casos_por_doenca &&
-          Object.keys(stats.casos_por_doenca).length > 0
-        ) {
-          statDoencas.innerHTML = Object.entries(stats.casos_por_doenca)
-            .map(
-              ([doenca, qtd]) =>
-                `<div class="flex justify-between"><span>${doenca}:</span><b class="text-sky-400">${qtd}</b></div>`,
-            )
-            .join("");
-        }
+        renderizarAgravos(stats.casos_por_doenca);
+        renderizarCidades(stats.casos_por_cidade_doenca);
       }
 
+      // Chips com o total de cada doença somando todos os municípios
+      function renderizarAgravos(porDoenca) {
+        const itens = Object.entries(porDoenca || {});
+        if (itens.length === 0) {
+          statDoencas.innerHTML =
+            '<span class="text-sm text-slate-500 italic">Aguardando dados...</span>';
+          return;
+        }
+        statDoencas.innerHTML = itens
+          .map(([doenca, qtd]) => {
+            const cor = COR_DOENCA[doenca] || COR_PADRAO;
+            return `
+              <div class="flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-900/60 border border-slate-700 text-sm">
+                <span class="w-2 h-2 rounded-full ${cor.dot}"></span>
+                <span class="text-slate-300">${titulo(doenca)}</span>
+                <b class="text-slate-100">${qtd}</b>
+              </div>`;
+          })
+          .join("");
+      }
+
+      // Um card por município: total + lista de doenças com nº de casos
+      function renderizarCidades(porCidade) {
+        const cidades = Object.entries(porCidade || {});
+        if (cidades.length === 0) {
+          cardsCidades.innerHTML = "";
+          return;
+        }
+
+        cardsCidades.innerHTML = cidades
+          .map(([cidade, doencas]) => {
+            // Doenças do painel aparecem sempre (mesmo com 0);
+            // as demais (ex.: POPULAR) só quando houver casos.
+            const linhas = Object.entries(doencas || {}).filter(
+              ([doenca, qtd]) => doenca in COR_DOENCA || qtd > 0,
+            );
+            const total = linhas.reduce((soma, [, qtd]) => soma + qtd, 0);
+
+            const itens = linhas
+              .map(([doenca, qtd]) => {
+                const cor = COR_DOENCA[doenca] || COR_PADRAO;
+                return `
+                  <li class="flex justify-between items-center text-sm">
+                    <span class="flex items-center gap-2 text-slate-300">
+                      <span class="w-2 h-2 rounded-full ${cor.dot}"></span>
+                      ${titulo(doenca)}
+                    </span>
+                    <b class="text-slate-100 text-base">${qtd}</b>
+                  </li>`;
+              })
+              .join("");
+
+            return `
+              <div class="bg-slate-800 p-5 rounded-xl border border-slate-700">
+                <div class="flex items-start justify-between">
+                  <div>
+                    <div class="text-xs uppercase tracking-wider text-slate-400">Município</div>
+                    <div class="text-lg font-bold text-slate-100">📍 ${titulo(cidade)}</div>
+                  </div>
+                  <div class="text-right">
+                    <div class="text-xs uppercase tracking-wider text-slate-400">Total</div>
+                    <div class="text-3xl font-extrabold text-sky-400">${total}</div>
+                  </div>
+                </div>
+                <ul class="mt-4 space-y-3">${itens}</ul>
+              </div>`;
+          })
+          .join("");
+      }
+
+      // ===================== FEED =====================
       function adicionarAoFeed(item) {
         historicoContagens.unshift(item);
         if (historicoContagens.length > 50) historicoContagens.pop();
@@ -240,55 +259,10 @@
                     <td class="p-3">${item.municipio || "-"}</td>
                     <td class="p-3 text-slate-400">${item.bairro || "TODOS"}</td>
                     <td class="p-3 font-bold text-amber-400 text-base">${item.quantidade_casos}</td>
-                    <td class="p-3 font-bold text-emerald-400 text-base">${item.casos_dia ?? "-"}</td>
-                    <td class="p-3 text-xs text-slate-400">${item.janela_fim || "-"}</td>
                     <td class="p-3 text-xs text-slate-500">${item.recebido_em ? new Date(item.recebido_em).toLocaleTimeString() : "-"}</td>
                 </tr>
             `,
           )
-          .join("");
-      }
-
-      // ===================== SURTOS =====================
-      const CORES_GRAVIDADE = {
-        MODERADA: "bg-yellow-500/10 border-yellow-500/60 text-yellow-300",
-        ALTA: "bg-orange-500/10 border-orange-500/60 text-orange-300",
-        CRITICO: "bg-rose-950/70 border-rose-700 text-rose-200",
-      };
-
-      function atualizarSurto(surto) {
-        if (!surto) return;
-        const chave = `${surto.doenca}|${surto.codigo_ibge}|${surto.bairro || ""}`;
-        cacheSurtos[chave] = surto;
-        renderizarSurtos(Object.values(cacheSurtos));
-      }
-
-      function renderizarSurtos(surtos) {
-        if (!surtos || surtos.length === 0) {
-          secaoSurtos.classList.add("hidden");
-          badgeSurtos.textContent = "0";
-          cardsSurtos.innerHTML = "";
-          return;
-        }
-        secaoSurtos.classList.remove("hidden");
-        badgeSurtos.textContent = surtos.length;
-        cardsSurtos.innerHTML = surtos
-          .map((s) => {
-            const cor =
-              CORES_GRAVIDADE[s.gravidade] || CORES_GRAVIDADE.MODERADA;
-            return `
-              <div class="p-4 rounded-xl border ${cor}">
-                <div class="flex justify-between items-start">
-                  <span class="text-xs font-bold uppercase tracking-wider">${s.gravidade}</span>
-                  <span class="text-xs opacity-70">${s.detectado_em ? new Date(s.detectado_em).toLocaleTimeString() : "-"}</span>
-                </div>
-                <div class="text-lg font-bold mt-2">${s.doenca}</div>
-                <div class="text-sm mt-1">📍 ${s.municipio}${s.bairro ? ` — ${s.bairro}` : ""}</div>
-                <div class="text-3xl font-extrabold mt-2">${s.casos} <span class="text-sm font-normal">casos no dia</span></div>
-                <div class="text-xs mt-2 opacity-80">Limiar: ${s.limiar} casos / dia de 5 min</div>
-                <div class="text-xs mt-1 opacity-60">Janela: ${hora(s.janela_inicio)} – ${hora(s.janela_fim)}</div>
-              </div>`;
-          })
           .join("");
       }
     </script>
