@@ -36,10 +36,6 @@ public class MotorAnalitico {
 
     private static final String BOOTSTRAP_SERVERS = "kafka:29092";
 
-    // IMPORTANTE: group_id "zerado" para este teste. Grupos antigos já têm
-    // offsets commitados no Kafka, o que faz o Flink IGNORAR earliest() e
-    // retomar de onde parou (às vezes à frente de todos os dados de teste).
-    // Ao trocar o group_id, garantimos que o Flink realmente comece do zero.
     private static final String GROUP_ID = "motor-analitico-epidemiologico-v2";
 
     private static final long JANELA_MS = Duration.ofHours(24).toMillis();
@@ -47,21 +43,25 @@ public class MotorAnalitico {
     public static void main(String[] args) throws Exception {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(2);
-        env.enableCheckpointing(60000);
+        // Checkpoint reduzido de 60s para 20s: em execucoes de teste de 5 minutos
+        // (compressao 24h->5min), um intervalo de 60s concentra poucos pontos de
+        // pausa distribuidos de forma grosseira ao longo da execucao, podendo
+        // aparecer como "solavancos" periodicos na serie de latencia coletada.
+        env.enableCheckpointing(20000);
 
         KafkaSource<String> source = KafkaSource.<String>builder()
                 .setBootstrapServers(BOOTSTRAP_SERVERS)
                 .setTopicPattern(Pattern.compile("epidemiologia_.*\\.public\\.notificacoes"))
                 .setGroupId(GROUP_ID)
-                .setStartingOffsets(OffsetsInitializer.earliest())
+                // ALTERADO PARA OS TESTES DE DESEMPENHO: latest() em vez de earliest().
+                // Cada execucao de teste deve medir SOMENTE os eventos gerados
+                // naquela rodada, sem reprocessar o historico acumulado de
+                // execucoes anteriores (o que inflaria throughput e distorceria
+                // a latencia com eventos "antigos" sendo processados de uma vez).
+                .setStartingOffsets(OffsetsInitializer.latest())
                 .setValueOnlyDeserializer(new SimpleStringSchema())
-                // CORREÇÃO CRÍTICA: sem isso, o Flink descobre os tópicos que
-                // casam com o padrão UMA ÚNICA VEZ, no instante em que o job
-                // sobe. Se o Debezium ainda não tiver criado os tópicos nesse
-                // exato momento (ex.: Flink subiu antes do CDC ser ativado),
-                // o source nunca mais volta a procurar — mesmo que os tópicos
-                // passem a existir segundos depois. Com esta propriedade, ele
-                // reavalia a lista de tópicos/partições a cada 10s.
+                // Sem isso, o Flink descobre os topicos que casam com o padrao
+                // UMA UNICA VEZ, no instante em que o job sobe. Reavalia a cada 10s.
                 .setProperty("partition.discovery.interval.ms", "10000")
                 .build();
 
@@ -102,7 +102,9 @@ public class MotorAnalitico {
     }
 
     public static class Notificacao implements Serializable {
-        public long timestamp;
+        public long timestamp;          // Event Time (dt_notificacao/dt_sintomas) - usado pelas janelas do Flink
+        public long sourceTsMs;         // source.ts_ms do Debezium (commit no WAL, UTC real) - usado para medir Le2e
+        public long idNotificacao;      // id_notificacao da tabela - so para conferencia/depuracao pontual
         public String municipio;
         public String codigoIbge;
         public String bairro;
@@ -111,8 +113,11 @@ public class MotorAnalitico {
 
         public Notificacao() {}
 
-        public Notificacao(long timestamp, String municipio, String codigoIbge, String bairro, String doenca, String cid10) {
+        public Notificacao(long timestamp, long sourceTsMs, long idNotificacao, String municipio,
+                            String codigoIbge, String bairro, String doenca, String cid10) {
             this.timestamp = timestamp;
+            this.sourceTsMs = sourceTsMs;
+            this.idNotificacao = idNotificacao;
             this.municipio = municipio;
             this.codigoIbge = codigoIbge;
             this.bairro = bairro;
@@ -140,7 +145,7 @@ public class MotorAnalitico {
      * A cada 20 mensagens recebidas do Kafka, imprime um resumo — isso confirma
      * visualmente se o operador está de fato recebendo e conseguindo extrair
      * as notificações, sem depender só de println por evento (que pode
-     * inundar o log).
+     * inundar o log e, sob carga do cenário de Surto, virar gargalo).
      */
     public static class ExtrairNotificacao implements FlatMapFunction<String, Notificacao> {
         private transient ObjectMapper mapper;
@@ -197,7 +202,19 @@ public class MotorAnalitico {
                     dataMillis = dataValue; // já em ms
                 }
 
-                out.collect(new Notificacao(dataMillis, municipio, codigoIbge, bairro, doenca, cid10));
+                // source.ts_ms: instante de commit no WAL do Postgres, capturado
+                // pelo proprio Debezium em UTC real (epoch millis). Ao contrario de
+                // dt_notificacao (TIMESTAMP sem fuso, sujeito a ambiguidade de
+                // interpretacao), este campo nao depende de conversao de fuso
+                // horario e e a referencia correta para medir Le2e = Tdestino - Torigem.
+                JsonNode sourceNode = raiz.get("source");
+                long sourceTsMs = (sourceNode != null && sourceNode.hasNonNull("ts_ms"))
+                        ? sourceNode.get("ts_ms").asLong(0L)
+                        : 0L;
+
+                long idNotificacao = numero(after, "id_notificacao");
+
+                out.collect(new Notificacao(dataMillis, sourceTsMs, idNotificacao, municipio, codigoIbge, bairro, doenca, cid10));
 
                 long okTotal = extraidas.incrementAndGet();
                 if (okTotal % 20 == 1) {
@@ -291,9 +308,12 @@ public class MotorAnalitico {
             payload.put("tipo_agregacao", tipo);
             payload.put("quantidade_casos", quantidade);
             payload.put("atualizado_em", Instant.now().toString());
+            // Origem real (UTC, via Debezium) para o calculo de Le2e = Tdestino - Torigem.
+            payload.put("origem_ts_ms", registro.notificacao.sourceTsMs);
+            // Apenas para conferencia pontual/depuracao - nao usado nos calculos agregados.
+            payload.put("id_ultima_notificacao", registro.notificacao.idNotificacao);
 
             String json = mapper.writeValueAsString(payload);
-            System.out.println("[DIAGNOSTICO] Emitindo para o sink: " + json);
             out.collect(json);
         }
     }
