@@ -157,19 +157,24 @@ def processar_mensagem(valor_bruto: str, silencioso: bool = False):
         )
 
 
-def _abrir_consumer_desde_o_inicio(tentativas=30, espera_seg=2):
+def _abrir_consumer_desde_o_inicio(espera_seg=2):
     """
     Cria um KafkaConsumer SEM group_id (nao commita/depende de offset salvo),
     atribui manualmente todas as particoes do topico de alertas e posiciona
     a leitura no comeco. Assim, toda vez que o servidor sobe, ele consegue
     reler o historico inteiro e reconstruir o estado.
 
+    Fica tentando INDEFINIDAMENTE ate o topico existir — nao desiste depois
+    de N tentativas. O dashboard deve ficar escutando continuamente, mesmo
+    que o Flink/Debezium ainda nao tenham publicado nada.
+
     Retorna (consumer, fim_bootstrap), onde fim_bootstrap e um dict
     TopicPartition -> offset (exclusivo) valido no instante da conexao:
     tudo que tiver offset menor que isso ja existia antes deste boot.
     """
     topico = "epidemiologia.alertas"
-    for tentativa in range(1, tentativas + 1):
+    print("[Kafka]Aguardando o tópico...")
+    while True:
         try:
             consumer = KafkaConsumer(
                 bootstrap_servers=["localhost:9092"],
@@ -185,15 +190,8 @@ def _abrir_consumer_desde_o_inicio(tentativas=30, espera_seg=2):
             consumer.seek_to_beginning(*tps)
             fim_bootstrap = consumer.end_offsets(tps)
             return consumer, fim_bootstrap
-        except Exception as e:
-            print(
-                f"[Kafka] Aguardando o tópico '{topico}' ficar disponível "
-                f"(tentativa {tentativa}/{tentativas}): {e}"
-            )
+        except Exception:
             time.sleep(espera_seg)
-
-    print(f"[Kafka] Não foi possível localizar o tópico '{topico}'. Consumer não iniciado.")
-    return None, {}
 
 
 def consumir_kafka():
@@ -210,8 +208,6 @@ def consumir_kafka():
     útil para não perder os casos já inseridos ao dar Ctrl+C e rodar de novo.
     """
     consumer, fim_bootstrap = _abrir_consumer_desde_o_inicio()
-    if consumer is None:
-        return
 
     total_bootstrap = sum(fim_bootstrap.values())
     if total_bootstrap > 0:

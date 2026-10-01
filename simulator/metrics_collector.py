@@ -3,22 +3,36 @@ import time
 import json
 import argparse
 import statistics
-import pandas as pd
 from datetime import datetime
 from kafka import KafkaConsumer, TopicPartition
 
+try:
+    import pandas as pd
+    PANDAS_DISPONIVEL = True
+except ImportError:
+    PANDAS_DISPONIVEL = False
+
 
 def juntar_em_excel(arquivo_csv, arquivo_amostras, nome_excel="resultados_teste.xlsx"):
-    """Lê os CSVs gerados e unifica-os num único ficheiro Excel com duas abas."""
+    """Lê os CSVs gerados e unifica-os num único ficheiro Excel com duas abas.
+    Se pandas/openpyxl não estiverem instalados, apenas avisa e segue em frente —
+    os dois CSVs já foram gravados normalmente e continuam utilizáveis."""
+    if not PANDAS_DISPONIVEL:
+        print(
+            "  ⚠ pandas não está instalado nesta máquina — pulei a geração do .xlsx. "
+            "Os CSVs já foram salvos normalmente (pip install pandas openpyxl para habilitar)."
+        )
+        return
+
     print(f"  A compilar os dados para o ficheiro Excel: {nome_excel}...")
     try:
         df_metricas = pd.read_csv(arquivo_csv)
         df_amostras = pd.read_csv(arquivo_amostras)
-        
+
         with pd.ExcelWriter(nome_excel, engine='openpyxl') as writer:
             df_metricas.to_excel(writer, sheet_name='Por_Segundo', index=False)
             df_amostras.to_excel(writer, sheet_name='Amostras_Individuais', index=False)
-            
+
         print("  ✅ Ficheiro Excel gerado com sucesso!")
     except Exception as e:
         print(f"  ⚠ Erro ao gerar Excel: {e}")
@@ -87,13 +101,17 @@ def run(kafka_host, kafka_port, topic, arquivo_csv, arquivo_amostras, duracao):
             "latencia_min_ms", "latencia_mediana_ms", "latencia_media_ms", "latencia_max_ms"
         ])
 
-    with open(arquivo_amostras, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["segundo", "doenca", "municipio", "latencia_ms", "origem_ts_ms", "recebido_ts_ms"])
+    # As amostras individuais ficam em memória durante toda a coleta e só são
+    # gravadas em disco UMA VEZ, no final (ver bloco "finally"). Escrever (abrir +
+    # gravar + fechar) um arquivo a cada mensagem individual, dentro do laço
+    # quente de consumo, é caro o suficiente para virar o próprio gargalo da
+    # medição sob carga alta (Cenário de Surto) — mascarando a vazão real da
+    # arquitetura atrás da vazão do próprio script de coleta.
+    amostras_buffer = []  # cada item: (segundo, doenca, municipio, latencia, ts_origem, recv_ms)
 
     eventos_cidade_total = 0
     alertas_bairro_total = 0
-    latencias_totais = [] 
+    latencias_totais = []
     avisos_latencia_alta = 0
     segundo_atual = 1
 
@@ -121,10 +139,10 @@ def run(kafka_host, kafka_port, topic, arquivo_csv, arquivo_amostras, duracao):
                             if tipo_agregacao == "BAIRRO":
                                 alertas_bairro_no_segundo += 1
                                 alertas_bairro_total += 1
-                                continue 
+                                continue
 
                             if tipo_agregacao != "CIDADE":
-                                continue 
+                                continue
 
                             eventos_cidade_no_segundo += 1
                             eventos_cidade_total += 1
@@ -151,12 +169,10 @@ def run(kafka_host, kafka_port, topic, arquivo_csv, arquivo_amostras, duracao):
 
                             latencias_no_segundo.append(latencia)
                             latencias_totais.append(latencia)
-
-                            with open(arquivo_amostras, "a", newline="", encoding="utf-8") as fa:
-                                csv.writer(fa).writerow([
-                                    segundo_atual, payload.get("doenca"), payload.get("municipio"),
-                                    latencia, ts_origem, recv_ms
-                                ])
+                            amostras_buffer.append((
+                                segundo_atual, payload.get("doenca"), payload.get("municipio"),
+                                latencia, ts_origem, recv_ms
+                            ))
 
                 except Exception:
                     pass
@@ -196,6 +212,11 @@ def run(kafka_host, kafka_port, topic, arquivo_csv, arquivo_amostras, duracao):
 
     finally:
         consumer.close()
+        print(f"\n  A gravar {len(amostras_buffer)} amostra(s) individuais em {arquivo_amostras}...")
+        with open(arquivo_amostras, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["segundo", "doenca", "municipio", "latencia_ms", "origem_ts_ms", "recebido_ts_ms"])
+            writer.writerows(amostras_buffer)
 
     duracao_real = max(segundo_atual - 1, 1)
     media_vazao = round(eventos_cidade_total / duracao_real, 2)
