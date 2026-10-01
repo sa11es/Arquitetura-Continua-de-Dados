@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Simulador Epidemiológico — ciclo comprimido
-5 minutos de execução = 24 horas simuladas.
-Gera a média diária de notificações por cidade/doença
-e injeta 1 surto garantido no último minuto.
+CENÁRIO 1 — BASAL ALEATÓRIO
+Simula um dia normal: volume basal, sem surto garantido.
+Valida a contagem e a transmissão dos dados: os totais inseridos
+devem bater com o processado pelo Flink e exibido no dashboard.
 
-Uso:
-  python gerador.py                  # surto aleatório (doença, cidade e bairro)
-  python gerador.py dengue           # surto garantido de dengue, resto sorteado
-  python gerador.py --seed 42        # rodada reproduzível
+Uso: python basal.py
+     python basal.py --seed 42            (rodada reproduzível)
+     python basal.py --duracao 60         (ciclo comprimido de 60s)
 """
 import sys
 import time
@@ -17,39 +16,32 @@ from datetime import datetime
 import psycopg2
 
 # ===================== CONFIG =====================
-CICLO_SEGUNDOS   = 300      # 5 min = 24h simuladas
+CICLO_SEGUNDOS   = 300      # 5 min = 24h simuladas (alterável via --duracao)
 FIM_BASE         = 240      # casos "do dia" distribuídos até aqui
-FATOR_CARGA      = 1.0      # reduza p/ 0.5 se Debezium não acompanhar o volume
-SEED             = None     # None = surto sorteado a cada execução
+SEED             = None     # None = aleatório a cada execução
 
 DB_CONFIGS = {
     "Ponta Grossa": {"port": 5433, "ibge": "4119905"},
     "Curitiba":     {"port": 5434, "ibge": "4106902"},
-    "Castro":       {"port": 5435, "ibge": "4104153"},  # conferir IBGE (4104907 no script antigo)
+    "Castro":       {"port": 5435, "ibge": "4104153"},
 }
 DB_USER, DB_PASS, DB_NAME, DB_HOST = "postgres", "postgrespassword", "sinan_db", "localhost"
 
-# Média diária: total da cidade + alvos monitorados (resto = POPULAR)
+# Escala real (média de notificações/dia) dividida por 100:
+#   Castro 1.625 -> 16,25 | Ponta Grossa 37.250 -> 372,5 | Curitiba 297.965 -> 2.979,65
 TAXAS = {
     "Ponta Grossa": {"total": 372,  "DENGUE": 0.37, "MENINGITE": 0.34, "INFLUENZA": 3.12},
     "Curitiba":     {"total": 2979, "DENGUE": 0.80, "MENINGITE": 0.57, "INFLUENZA": 16.0},
-    "Castro":       {"total": 162,  "DENGUE": 0.03, "MENINGITE": 0.005, "INFLUENZA": 0.12},
+    "Castro":       {"total": 16,   "DENGUE": 0.03, "MENINGITE": 0.005, "INFLUENZA": 0.12},
 }
 
-CID10      = {"DENGUE": "A90", "MENINGITE": "A39", "INFLUENZA": "J11"}
+CID10       = {"DENGUE": "A90", "MENINGITE": "A39", "INFLUENZA": "J11"}
 CID_POPULAR = ["A09", "J18", "K04"]   # gastroenterite, pneumonia, odontológico
 
 BAIRROS = {
     "Ponta Grossa": ["CENTRO", "OFICINAS", "UVARANAS", "NOVA RUSSIA", "CARLOS CARVALHO"],
     "Curitiba":     ["CENTRO", "BATEL", "BOQUEIRAO", "SITIO CERCADO", "PINHEIRINHO"],
     "Castro":       ["CENTRO", "COHAB", "VILA ISA", "MOCAMINHO"],
-}
-
-# Mínimos que GARANTEM o disparo do alerta
-SURTO = {
-    "MENINGITE": {"n": 3,  "bairro_fixo": False},
-    "DENGUE":    {"n": 6,  "bairro_fixo": False},   # 6 na cidade cobre a regra
-    "INFLUENZA": {"n": 20, "bairro_fixo": True},    # 20 no mesmo bairro cobre a regra
 }
 
 # ===================== HELPERS =====================
@@ -60,37 +52,30 @@ def sortear(qtd_media):
     n = int(qtd_media)
     return n + (1 if random.random() < (qtd_media - n) else 0)
 
-def montar_agenda(doenca_forcada=None):
+def montar_agenda():
     agenda = []
+    resumo = {}
     for cidade, tx in TAXAS.items():
         n_deng = sortear(tx["DENGUE"])
         n_men  = sortear(tx["MENINGITE"])
         n_inf  = sortear(tx["INFLUENZA"])
-        n_pop  = max(0, tx["total"] - n_deng - n_men - n_inf)
+        n_pop  = max(0, int(tx["total"]) - n_deng - n_men - n_inf)
 
         plano = ([("DENGUE", CID10["DENGUE"])] * n_deng +
                  [("MENINGITE", CID10["MENINGITE"])] * n_men +
                  [("INFLUENZA", CID10["INFLUENZA"])] * n_inf +
                  [("POPULAR", random.choice(CID_POPULAR))] * n_pop)
 
+        resumo[cidade] = {"DENGUE": n_deng, "MENINGITE": n_men,
+                          "INFLUENZA": n_inf, "POPULAR": n_pop,
+                          "TOTAL": len(plano)}
+
         for doenca, cid in plano:
             agenda.append((random.uniform(0, FIM_BASE), cidade, doenca, cid,
                            random.choice(BAIRROS[cidade])))
 
-    # ---------- SURTO GARANTIDO (último minuto) ----------
-    doenca_surto = (doenca_forcada if doenca_forcada in SURTO
-                    else random.choice(list(SURTO.keys())))
-    cidade_surto = random.choice(list(TAXAS.keys()))
-    bairro_base  = random.choice(BAIRROS[cidade_surto])
-    regra = SURTO[doenca_surto]
-
-    for _ in range(regra["n"]):
-        t = random.uniform(FIM_BASE + 2, CICLO_SEGUNDOS - 1)
-        bairro = bairro_base if regra["bairro_fixo"] else random.choice(BAIRROS[cidade_surto])
-        agenda.append((t, cidade_surto, doenca_surto, CID10[doenca_surto], bairro))
-
     agenda.sort(key=lambda e: e[0])
-    return agenda, (doenca_surto, cidade_surto, bairro_base, regra["n"])
+    return agenda, resumo
 
 # ===================== BANCO =====================
 SQL = """INSERT INTO public.notificacoes
@@ -119,42 +104,36 @@ def inserir(conn, cidade, doenca, cid, bairro, quando):
 
 # ===================== MAIN =====================
 def main():
-    args = sys.argv[1:]
-
-    # --seed N  -> rodada reproduzível
-    seed = SEED
-    if "--seed" in args:
+    global CICLO_SEGUNDOS
+    # --duracao N: comprime o ciclo em N segundos (padrão: 300)
+    if "--duracao" in sys.argv:
         try:
-            seed = int(args[args.index("--seed") + 1])
+            CICLO_SEGUNDOS = int(sys.argv[sys.argv.index("--duracao") + 1])
         except (IndexError, ValueError):
-            print("Uso incorreto de --seed. Ex: python gerador.py --seed 42")
-            sys.exit(1)
-        idx = args.index("--seed")
-        args = args[:idx] + args[idx + 2:]
-
-    # argumento posicional opcional: nome da doença do surto
-    doenca_forcada = None
-    if args:
-        candidato = args[0].upper()
-        if candidato in SURTO:
-            doenca_forcada = candidato
-        else:
-            print(f"Doença '{candidato}' não reconhecida. Opções: {', '.join(SURTO.keys())}")
+            print("Uso: python basal.py --duracao 60")
             sys.exit(1)
 
-    if seed is not None:
-        random.seed(seed)
+    # --seed N: rodada reproduzível
+    if "--seed" in sys.argv:
+        try:
+            random.seed(int(sys.argv[sys.argv.index("--seed") + 1]))
+        except (IndexError, ValueError):
+            print("Uso: python basal.py --seed 42")
+            sys.exit(1)
 
-    agenda, (doenca_s, cidade_s, bairro_s, n_s) = montar_agenda(doenca_forcada)
+    agenda, resumo = montar_agenda()
     total_pop = sum(1 for e in agenda if e[2] == "POPULAR")
-    print(f"🚀 Ciclo de {CICLO_SEGUNDOS}s = 24h simuladas | {len(agenda)} notificações "
-          f"({total_pop} de preenchimento)")
-    print(f"🚨 Surto planejado: {n_s} casos de {doenca_s} em {cidade_s} "
-          f"(bairro âncora: {bairro_s})\n")
+    print(f"🚀 CENÁRIO BASAL ALEATÓRIO | Ciclo de {CICLO_SEGUNDOS}s = 24h simuladas | "
+          f"{len(agenda)} notificações ({total_pop} de preenchimento)\n")
+    for cidade, r in resumo.items():
+        print(f"   📍 {cidade:<13} total={r['TOTAL']:<5} dengue={r['DENGUE']} "
+              f"meningite={r['MENINGITE']} influenza={r['INFLUENZA']} "
+              f"preenchimento={r['POPULAR']}")
+    print("\nSem surto — validação de contagem e transmissão ponta a ponta.\n")
 
     conns = abrir_conexoes()
     t0 = time.time()
-    ok = surto_ok = 0
+    ok, por_cidade = 0, {}
     try:
         for t, cidade, doenca, cid, bairro in agenda:
             atraso = t0 + t - time.time()
@@ -162,17 +141,19 @@ def main():
                 time.sleep(atraso)
             if inserir(conns[cidade], cidade, doenca, cid, bairro, datetime.now()):
                 ok += 1
-                if doenca == doenca_s and cidade == cidade_s:
-                    surto_ok += 1
-                    print(f"🚨 [{surto_ok}/{n_s}] SURTO {doenca_s} → {cidade_s} "
-                          f"(bairro: {bairro})")
+                por_cidade[cidade] = por_cidade.get(cidade, 0) + 1
     except KeyboardInterrupt:
         print("\n🛑 Interrompido pelo usuário.")
     finally:
         for c in conns.values():
             c.close()
-    print(f"\n✅ Fim do ciclo: {ok}/{len(agenda)} inseridos | "
-          f"Surto de {doenca_s}: {surto_ok}/{n_s} casos injetados em {cidade_s}")
+
+    print(f"\n✅ Fim do ciclo: {ok}/{len(agenda)} inseridos")
+    for cidade in TAXAS:
+        planejado = resumo[cidade]["TOTAL"]
+        inseridos = por_cidade.get(cidade, 0)
+        status = "✅" if inseridos == planejado else "⚠️"
+        print(f"   {status} {cidade}: {inseridos}/{planejado}")
 
 if __name__ == "__main__":
     main()
