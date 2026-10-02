@@ -17,7 +17,6 @@ import psycopg2
 
 # ===================== CONFIG =====================
 CICLO_SEGUNDOS   = 300      # 5 min = 24h simuladas (alterável via --duracao)
-FIM_BASE         = 240      # casos "do dia" distribuídos até aqui
 SEED             = None     # None = aleatório a cada execução
 
 DB_CONFIGS = {
@@ -71,7 +70,7 @@ def montar_agenda():
                           "TOTAL": len(plano)}
 
         for doenca, cid in plano:
-            agenda.append((random.uniform(0, FIM_BASE), cidade, doenca, cid,
+            agenda.append((random.uniform(0, CICLO_SEGUNDOS), cidade, doenca, cid,
                            random.choice(BAIRROS[cidade])))
 
     agenda.sort(key=lambda e: e[0])

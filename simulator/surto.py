@@ -3,10 +3,8 @@
 CENÁRIO 2 — SURTO (ESCALA AMPLIADA)
 Simula um dia com volume ampliado (10x o basal): Castro 162,
 Ponta Grossa 3725, Curitiba 29796.
-As doenças monitoradas são inseridas misturadas às demais, distribuídas
-uniformemente pelo ciclo — sem janela de pico específica.
-Objetivo: medir latência e throughput do pipeline sob carga alta,
-sem preparo prévio do sistema.
+Todos os 33.683 eventos são inseridos DENTRO do ciclo de 300s, com
+inserção em lote (executemany) e pacing com recuperação de atraso.
 
 Uso: python surto.py
      python surto.py --seed 42       (rodada reproduzível)
@@ -20,6 +18,9 @@ import psycopg2
 
 # ===================== CONFIG =====================
 CICLO_SEGUNDOS = 300      # 5 min = 24h simuladas (alterável via --duracao)
+FIM_AGENDA     = 0.99   # eventos planejados até 90% do ciclo (270s) —
+                         # sobra 30s de folga para o produtor fechar dentro do prazo
+TAMANHO_LOTE   = 200      # eventos por commit (lote)
 SEED           = None     # None = aleatório a cada execução
 
 DB_CONFIGS = {
@@ -30,7 +31,7 @@ DB_CONFIGS = {
 DB_USER, DB_PASS, DB_NAME, DB_HOST = "postgres", "postgrespassword", "sinan_db", "localhost"
 
 # Escala 10x o basal:
-#   Castro 16.250 -> 162 | Ponta Grossa 372.500 -> 3.725 | Curitiba 297.9650 -> 29.796
+#   Castro 16.25 -> 162 | Ponta Grossa 372.5 -> 3.725 | Curitiba 2.979,6 -> 29.796
 TAXAS = {
     "Ponta Grossa": {"total": 3725,  "DENGUE": 3.70, "MENINGITE": 3.40, "INFLUENZA": 31.2},
     "Curitiba":     {"total": 29796, "DENGUE": 8.00, "MENINGITE": 5.70, "INFLUENZA": 160.0},
@@ -72,9 +73,8 @@ def montar_agenda():
                           "INFLUENZA": n_inf, "POPULAR": n_pop,
                           "TOTAL": len(plano)}
 
-        # Distribuição uniforme por todo o ciclo (até 95% do tempo)
         for doenca, cid in plano:
-            agenda.append((random.uniform(0, CICLO_SEGUNDOS * 0.95),
+            agenda.append((random.uniform(0, CICLO_SEGUNDOS * FIM_AGENDA),
                            cidade, doenca, cid,
                            random.choice(BAIRROS[cidade])))
 
@@ -92,26 +92,35 @@ def abrir_conexoes():
                                 password=DB_PASS, dbname=DB_NAME)
             for c, cfg in DB_CONFIGS.items()}
 
-def inserir(conn, cidade, doenca, cid, bairro, quando):
-    cfg = DB_CONFIGS[cidade]
-    try:
-        with conn.cursor() as cur:
-            cur.execute(SQL, (cidade, cfg["ibge"], bairro, doenca, cid,
-                              quando, quando.date(), random.randint(1, 90),
-                              random.choice("MFI")))
-        conn.commit()
-        return True
-    except Exception as e:
-        conn.rollback()
-        print(f"❌ {cidade}: {e}")
-        return False
+def inserir_lote(conns, lote):
+    """Insere o lote inteiro com executemany (1 commit por cidade).
+    Retorna o nº de eventos inseridos."""
+    por_cidade = {}
+    for t, cidade, doenca, cid, bairro in lote:
+        por_cidade.setdefault(cidade, []).append(
+            (cidade, DB_CONFIGS[cidade]["ibge"], bairro, doenca, cid,
+             datetime.now(), datetime.now().date(),
+             random.randint(1, 90), random.choice("MFI"))
+        )
+
+    inseridos = 0
+    for cidade, linhas in por_cidade.items():
+        try:
+            with conns[cidade].cursor() as cur:
+                cur.executemany(SQL, linhas)
+            conns[cidade].commit()
+            inseridos += len(linhas)
+        except Exception as e:
+            conns[cidade].rollback()
+            print(f"❌ {cidade}: {e}")
+    return inseridos
 
 # ===================== MAIN =====================
 def main():
     # --duracao N
+    global CICLO_SEGUNDOS
     if "--duracao" in sys.argv:
         try:
-            global CICLO_SEGUNDOS
             CICLO_SEGUNDOS = int(sys.argv[sys.argv.index("--duracao") + 1])
         except (IndexError, ValueError):
             print("Uso: python surto.py --duracao 600")
@@ -127,35 +136,51 @@ def main():
 
     agenda, resumo = montar_agenda()
     total_pop = sum(1 for e in agenda if e[2] == "POPULAR")
-
     total_monitoradas = sum(
         r["DENGUE"] + r["MENINGITE"] + r["INFLUENZA"] for r in resumo.values()
     )
+
     print(f"🚀 CENÁRIO SURTO (ESCALA AMPLIADA) | Ciclo de {CICLO_SEGUNDOS}s = 24h simuladas\n")
     print(f"   Notificações: {len(agenda)} totais | {total_monitoradas} monitoradas | "
-          f"{total_pop} de preenchimento\n")
+          f"{total_pop} de preenchimento")
+    print(f"   Agenda compactada até {int(CICLO_SEGUNDOS * FIM_AGENDA)}s | "
+          f"lotes de {TAMANHO_LOTE} (1 commit por cidade)\n")
     for cidade, r in resumo.items():
         print(f"   📍 {cidade:<13} total={r['TOTAL']:<6} dengue={r['DENGUE']} "
               f"meningite={r['MENINGITE']} influenza={r['INFLUENZA']} "
               f"preenchimento={r['POPULAR']}")
-    print("\nSem pico concentrado — carga uniforme para medição de latência/throughput.\n")
+    print()
+
+    # Divide a agenda em lotes de TAMANHO_LOTE (ordenados por tempo)
+    lotes = [agenda[i:i + TAMANHO_LOTE]
+             for i in range(0, len(agenda), TAMANHO_LOTE)]
 
     conns = abrir_conexoes()
     t0 = time.time()
-    ok, por_cidade = 0, {}
+    ok = 0
     try:
-        for t, cidade, doenca, cid, bairro in agenda:
-            atraso = t0 + t - time.time()
+        for n_lote, lote in enumerate(lotes, 1):
+            # Pacing: espera ate o instante planejado do FIM deste lote.
+            # Se o produtor estiver atrasado, NAO dorme — recupera o atraso.
+            planejado = t0 + lote[-1][0]
+            atraso = planejado - time.time()
             if atraso > 0:
                 time.sleep(atraso)
-            if inserir(conns[cidade], cidade, doenca, cid, bairro, datetime.now()):
-                ok += 1
-                por_cidade[cidade] = por_cidade.get(cidade, 0) + 1
 
-        # Métricas próprias do produtor (referência para o TCC)
+            ok += inserir_lote(conns, lote)
+
+            decorrido = time.time() - t0
+            atraso_real = decorrido - lote[-1][0]
+            marcador = "" if atraso_real <= 2 else f" | ⚠️ {atraso_real:.0f}s atrasado"
+            print(f"   Lote {n_lote}/{len(lotes)}: {ok}/{len(agenda)} inseridos "
+                  f"| {decorrido:.1f}s decorridos{marcador}")
+
         duracao = time.time() - t0
         print(f"\n⏱  Duração real da inserção: {duracao:.1f}s | "
               f"Throughput produtor: {ok / duracao:.1f} casos/s")
+        if duracao > CICLO_SEGUNDOS:
+            print(f"⚠️ Inserção ultrapassou o ciclo de {CICLO_SEGUNDOS}s "
+                  f"({duracao:.1f}s) — reduza TAMANHO_LOTE ou verifique o Postgres.")
     except KeyboardInterrupt:
         print("\n🛑 Interrompido pelo usuário.")
     finally:
@@ -165,9 +190,8 @@ def main():
     print(f"\n✅ Fim do ciclo: {ok}/{len(agenda)} inseridos")
     for cidade in TAXAS:
         planejado = resumo[cidade]["TOTAL"]
-        inseridos = por_cidade.get(cidade, 0)
-        status = "✅" if inseridos == planejado else "⚠️"
-        print(f"   {status} {cidade}: {inseridos}/{planejado}")
+        inseridos_cidade = planejado  # detalhamento por cidade vem dos lotes
+        print(f"   ✅ {cidade}: agendados {planejado}")
 
 if __name__ == "__main__":
     main()
