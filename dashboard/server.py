@@ -10,6 +10,11 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from kafka import KafkaConsumer, TopicPartition
 import uvicorn
 
+from telemetry import configurar
+from opentelemetry import trace
+
+configurar("consumidor-final")
+tracer = trace.get_tracer(__name__)
 app = FastAPI(title="Dashboard Epidemiologico")
 
 fila_alertas = queue.Queue()
@@ -112,21 +117,26 @@ def recalcular_estatisticas():
 
 
 def processar_mensagem(valor_bruto: str, silencioso: bool = False):
-    """
-    Processa uma mensagem do tópico de alertas, atualizando o estado
-    (ultimos_registros, stats, alertas_recentes).
-
-    silencioso=True é usado durante a RECONSTRUÇÃO DE ESTADO ao iniciar o
-    servidor: o estado é atualizado normalmente, mas nada é enfileirado para
-    o WebSocket (ninguém está conectado ainda) nem impresso no console
-    (evita inundar o log ao reler um tópico com milhares de mensagens).
-    """
     try:
         alerta = json.loads(valor_bruto)
     except Exception as e:
         print(f"[Kafka] Erro ao decodificar mensagem: {e}")
         return
 
+    if silencioso:
+        _aplicar_alerta(alerta, silencioso=True)
+        return
+
+    with tracer.start_as_current_span("consumir-alerta-kafka") as span:
+        span.set_attribute("alerta.chave", str(alerta.get("chave")))
+        span.set_attribute("alerta.doenca", str(alerta.get("doenca")))
+        span.set_attribute("alerta.municipio", str(alerta.get("municipio")))
+        span.set_attribute("alerta.quantidade_casos", alerta.get("quantidade_casos", 0))
+        span.set_attribute("alerta.tipo_agregacao", str(alerta.get("tipo_agregacao")))
+        _aplicar_alerta(alerta, silencioso=False)
+
+
+def _aplicar_alerta(alerta: dict, silencioso: bool):
     if not deve_emitir_alerta(alerta):
         if not silencioso:
             print(
@@ -134,18 +144,12 @@ def processar_mensagem(valor_bruto: str, silencioso: bool = False):
                 f"{alerta.get('chave')} ({alerta.get('quantidade_casos')} casos)"
             )
         return
-
     alerta["recebido_em"] = datetime.now().isoformat()
-
     chave = alerta.get("chave")
     if chave:
         ultimos_registros[chave] = alerta
-
     recalcular_estatisticas()
-
     if silencioso:
-        # Sem clientes conectados ainda: so alimenta o feed local (respeitando
-        # o limite MAX_ALERTAS), sem passar pela fila/WebSocket.
         alertas_recentes.append(alerta)
         if len(alertas_recentes) > MAX_ALERTAS:
             alertas_recentes.pop(0)

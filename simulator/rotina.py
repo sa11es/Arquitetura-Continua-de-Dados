@@ -1,24 +1,17 @@
 # -*- coding: utf-8 -*-
-"""
-CENÁRIO 1 — BASAL ALEATÓRIO
-Simula um dia normal: volume basal, sem surto garantido.
-Valida a contagem e a transmissão dos dados: os totais inseridos
-devem bater com o processado pelo Flink e exibido no dashboard.
-
-Uso: python basal.py
-     python basal.py --seed 42            (rodada reproduzível)
-     python basal.py --duracao 60         (ciclo comprimido de 60s)
-"""
 import sys
 import time
 import random
 from datetime import datetime
 import psycopg2
+from telemetry import configurar
+from opentelemetry import trace
 
-# ===================== CONFIG =====================
-CICLO_SEGUNDOS   = 300      # 5 min = 24h simuladas (alterável via --duracao)
-FIM_BASE         = 240      # casos "do dia" distribuídos até aqui
-SEED             = None     # None = aleatório a cada execução
+configurar("produtor-carga")
+tracer = trace.get_tracer(__name__)
+
+CICLO_SEGUNDOS = 300
+SEED = None
 
 DB_CONFIGS = {
     "Ponta Grossa": {"port": 5433, "ibge": "4119905"},
@@ -27,16 +20,14 @@ DB_CONFIGS = {
 }
 DB_USER, DB_PASS, DB_NAME, DB_HOST = "postgres", "postgrespassword", "sinan_db", "localhost"
 
-# Escala real (média de notificações/dia) dividida por 100:
-#   Castro 1.625 -> 16,25 | Ponta Grossa 37.250 -> 372,5 | Curitiba 297.965 -> 2.979,65
 TAXAS = {
     "Ponta Grossa": {"total": 372,  "DENGUE": 0.37, "MENINGITE": 0.34, "INFLUENZA": 3.12},
     "Curitiba":     {"total": 2979, "DENGUE": 0.80, "MENINGITE": 0.57, "INFLUENZA": 16.0},
     "Castro":       {"total": 16,   "DENGUE": 0.03, "MENINGITE": 0.005, "INFLUENZA": 0.12},
 }
 
-CID10       = {"DENGUE": "A90", "MENINGITE": "A39", "INFLUENZA": "J11"}
-CID_POPULAR = ["A09", "J18", "K04"]   # gastroenterite, pneumonia, odontológico
+CID10 = {"DENGUE": "A90", "MENINGITE": "A39", "INFLUENZA": "J11"}
+CID_POPULAR = ["A09", "J18", "K04"]
 
 BAIRROS = {
     "Ponta Grossa": ["CENTRO", "OFICINAS", "UVARANAS", "NOVA RUSSIA", "CARLOS CARVALHO"],
@@ -44,22 +35,22 @@ BAIRROS = {
     "Castro":       ["CENTRO", "COHAB", "VILA ISA", "MOCAMINHO"],
 }
 
-# ===================== HELPERS =====================
+
 def sortear(qtd_media):
-    """Converte média diária fracionária em nº de casos do ciclo."""
     if qtd_media < 1:
         return 1 if random.random() < qtd_media else 0
     n = int(qtd_media)
     return n + (1 if random.random() < (qtd_media - n) else 0)
+
 
 def montar_agenda():
     agenda = []
     resumo = {}
     for cidade, tx in TAXAS.items():
         n_deng = sortear(tx["DENGUE"])
-        n_men  = sortear(tx["MENINGITE"])
-        n_inf  = sortear(tx["INFLUENZA"])
-        n_pop  = max(0, int(tx["total"]) - n_deng - n_men - n_inf)
+        n_men = sortear(tx["MENINGITE"])
+        n_inf = sortear(tx["INFLUENZA"])
+        n_pop = max(0, int(tx["total"]) - n_deng - n_men - n_inf)
 
         plano = ([("DENGUE", CID10["DENGUE"])] * n_deng +
                  [("MENINGITE", CID10["MENINGITE"])] * n_men +
@@ -71,41 +62,50 @@ def montar_agenda():
                           "TOTAL": len(plano)}
 
         for doenca, cid in plano:
-            agenda.append((random.uniform(0, FIM_BASE), cidade, doenca, cid,
+            agenda.append((random.uniform(0, CICLO_SEGUNDOS), cidade, doenca, cid,
                            random.choice(BAIRROS[cidade])))
 
     agenda.sort(key=lambda e: e[0])
     return agenda, resumo
 
-# ===================== BANCO =====================
+
 SQL = """INSERT INTO public.notificacoes
  (municipio_residencia, codigo_ibge, bairro, doenca, cid_10,
   dt_notificacao, dt_sintomas, idade, sexo, status_caso)
- VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'SUSPEITO');"""
+ VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'SUSPEITO')
+ RETURNING id_notificacao;"""
+
 
 def abrir_conexoes():
     return {c: psycopg2.connect(host=DB_HOST, port=cfg["port"], user=DB_USER,
                                 password=DB_PASS, dbname=DB_NAME)
             for c, cfg in DB_CONFIGS.items()}
 
+
 def inserir(conn, cidade, doenca, cid, bairro, quando):
     cfg = DB_CONFIGS[cidade]
     try:
-        with conn.cursor() as cur:
-            cur.execute(SQL, (cidade, cfg["ibge"], bairro, doenca, cid,
-                              quando, quando.date(), random.randint(1, 90),
-                              random.choice("MFI")))
-        conn.commit()
-        return True
+        with tracer.start_as_current_span("inserir-evento-postgres") as span:
+            span.set_attribute("evento.cidade", cidade)
+            span.set_attribute("evento.doenca", doenca)
+            span.set_attribute("evento.cid", cid)
+            span.set_attribute("evento.bairro", bairro)
+            with conn.cursor() as cur:
+                cur.execute(SQL, (cidade, cfg["ibge"], bairro, doenca, cid,
+                                  quando, quando.date(), random.randint(1, 90),
+                                  random.choice("MFI")))
+                evento_id = cur.fetchone()[0]
+            conn.commit()
+            span.set_attribute("evento.id", evento_id)
+            return True
     except Exception as e:
         conn.rollback()
         print(f"❌ {cidade}: {e}")
         return False
 
-# ===================== MAIN =====================
+
 def main():
     global CICLO_SEGUNDOS
-    # --duracao N: comprime o ciclo em N segundos (padrão: 300)
     if "--duracao" in sys.argv:
         try:
             CICLO_SEGUNDOS = int(sys.argv[sys.argv.index("--duracao") + 1])
@@ -113,7 +113,6 @@ def main():
             print("Uso: python basal.py --duracao 60")
             sys.exit(1)
 
-    # --seed N: rodada reproduzível
     if "--seed" in sys.argv:
         try:
             random.seed(int(sys.argv[sys.argv.index("--seed") + 1]))
@@ -154,6 +153,7 @@ def main():
         inseridos = por_cidade.get(cidade, 0)
         status = "✅" if inseridos == planejado else "⚠️"
         print(f"   {status} {cidade}: {inseridos}/{planejado}")
+
 
 if __name__ == "__main__":
     main()
