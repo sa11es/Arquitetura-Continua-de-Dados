@@ -1,646 +1,342 @@
-# 📊 TCC - Prova de Conceito (PoC)
+# Modernização de Sistemas Legados para Vigilância Epidemiológica em Tempo Real
 
-**Arquitetura de Integração Contínua: Modernização de Sistemas Legados para Vigilância Epidemiológica em Tempo Real**
+Protótipo desenvolvido como Trabalho de Conclusão de Curso do Bacharelado em Engenharia de Software da Universidade Estadual de Ponta Grossa (UEPG).
 
-Modernização de sistemas legados de vigilância epidemiológica (inspirados no SINAN) através de uma arquitetura orientada a eventos, usando **Debezium (CDC)**, **Apache Kafka** e **Apache Flink**, com um dashboard em tempo real via **WebSocket**.
-
-Autores: Luís Eduardo Salles Rosa e Murilo Flores
-Orientador: Prof. Márcio Augusto de Souza | Coorientadora: Priscilla Vanessa Alves Santos
-
----
-
-## 🎯 Visão geral
-
-O projeto simula três municípios (Ponta Grossa, Curitiba e Castro), cada um com seu próprio banco de dados legado (PostgreSQL). Sempre que uma notificação epidemiológica é inserida em qualquer um desses bancos, o pipeline abaixo é disparado automaticamente, sem a necessidade de rotinas de ETL em lote:
-
-```
-PostgreSQL (3 cidades) → Debezium (CDC) → Kafka (tópicos raw)
-    → Apache Flink (agregação com estado, em tempo real)
-        → Kafka (tópico de alertas) → Dashboard (FastAPI + WebSocket)
-```
-
-O objetivo é demonstrar que é possível substituir o modelo tradicional de consolidação em lote (como o do SINAN, que pode levar dias/semanas) por um fluxo contínuo que disponibiliza a contagem de casos por doença/cidade/bairro em **tempo real**, na casa dos segundos.
+**Autores:** Luís Eduardo Salles Rosa e Murilo Flores
+**Orientador:** Prof. Márcio Augusto de Souza
+**Coorientadora:** Priscilla Vanessa Alves Santos
 
 ---
 
-## 🏗️ Arquitetura em 4 camadas
+## 1. A proposta
 
-| Camada                   | Tecnologia                  | Função                                                                                |
-| ------------------------ | --------------------------- | ------------------------------------------------------------------------------------- |
-| **1. Origem e Ingestão** | PostgreSQL + Debezium (CDC) | Captura `INSERT`s na tabela `notificacoes` via WAL, sem impactar o banco transacional |
-| **2. Transporte**        | Apache Kafka                | Barramento de eventos, um tópico por cidade + um tópico de alertas                    |
-| **3. Inteligência**      | Apache Flink                | Processa os eventos com estado (`KeyedProcessFunction`) e calcula contagens por chave |
-| **4. Ação e Consumo**    | FastAPI + WebSocket         | Recebe as contagens do Kafka e atualiza o dashboard ao vivo no navegador              |
+Os sistemas de vigilância epidemiológica brasileiros, como o Sinan, funcionam em boa parte por consolidação em lote: as notificações são registradas em bases locais, acumuladas e só depois consolidadas por níveis administrativos (municipal, estadual, federal). Entre o registro de um caso e a sua disponibilidade para análise, passam-se dias ou semanas.
 
-### Por que `KeyedProcessFunction` em vez de `SlidingEventTimeWindows`?
+Este projeto propõe uma **modernização incremental**: em vez de substituir o banco de dados legado, adiciona-se uma camada orientada a eventos ao redor dele. Cada inserção feita no banco é capturada no instante em que acontece, transportada por um barramento de mensagens, processada em fluxo e entregue a um painel em tempo real, sem executar consultas de varredura no banco operacional.
 
-A primeira versão do motor analítico usava uma janela deslizante nativa do Flink (`SlidingEventTimeWindows`, 24h de tamanho / 10s de slide). Isso causava uma explosão de estado: cada evento era replicado em `24h ÷ 10s = 8.640` janelas simultâneas, gerando backpressure e atrasos que impediam o dashboard de atualizar em tempo real.
+O objetivo é reduzir o tempo entre a persistência de um registro na fonte relacional e a sua disponibilização para a vigilância. Esse tempo é medido de ponta a ponta como **latência (Le2e)**, junto com a **vazão (throughput)** da arquitetura.
 
-A solução adotada mantém a mesma semântica (contagem das últimas 24h por chave), mas implementada via `KeyedProcessFunction`: cada chave guarda apenas a lista de timestamps ainda "ativos", com expiração via `registerEventTimeTimer`. Isso reduz o custo de O(tamanho/slide) para O(1) por evento, e emite a contagem atualizada imediatamente a cada notificação nova, em vez de esperar o próximo "slide".
+Para isso, o protótipo integra:
 
----
-
-## 📁 Estrutura do repositório
-
-```
-TCC- Prova de Conceito/
-├── infra/
-│   └── docker-compose.yml       # Orquestra todos os containers
-├── database/
-│   └── init.sql                 # Schema da tabela notificacoes + triggers
-├── flink-job/
-│   ├── pom.xml
-│   └── src/main/java/br/edu/tcc/
-│       └── MotorAnalitico.java  # Job Flink (extração, chaves, KeyedProcessFunction)
-├── dashboard/
-│   ├── server.py                # Servidor FastAPI (consumer Kafka + WebSocket)
-│   └── index.html               # Front-end do dashboard
-├── simulator/
-│   ├── auditoria.py             # Gera uma carga controlada (ex: 30 casos) para validação
-│   ├── gerador.py                # Gerador de carga contínuo
-│   ├── simulador_continuo.py
-│   ├── metrics_collector.py     # Coleta métricas de latência/throughput (próximo passo)
-│   └── teste.py
-├── ativar_cdc_debezium.py       # Registra os 3 conectores Debezium (um por cidade)
-└── README.md
-```
+| Camada | Tecnologia | Papel |
+|---|---|---|
+| Origem | PostgreSQL 15 | Três bancos independentes, que simulam o legado de três municípios |
+| Captura | Debezium 2.4 (CDC) | Lê o log de transações (WAL) e transforma cada inserção em um evento |
+| Transporte | Apache Kafka 3.5.1 | Barramento de eventos durável e desacoplado |
+| Processamento | Apache Flink 1.17.1 | Agrega as notificações em fluxo, com estado |
+| Consumo | FastAPI + WebSocket | Entrega as contagens ao painel web em tempo real |
 
 ---
 
-## ✅ Status atual do projeto
+## 2. Visão geral da arquitetura
 
-- **Infraestrutura Docker**: `docker-compose.yml` configurado com 3 bancos PostgreSQL (um por cidade), Zookeeper, Kafka, Debezium Connect e um cluster Flink (1 JobManager + 1 TaskManager, 2 task slots).
-- **Banco de dados legado**: schema `sinan_db` com a tabela `notificacoes`, populada via CDC (WAL, `wal_level=logical`).
-- **CDC e Mensageria**: os 3 conectores Debezium (`sinan-postgres-ponta-grossa`, `sinan-postgres-curitiba`, `sinan-postgres-castro`) capturam inserções em tempo real e publicam nos tópicos Kafka `epidemiologia_<cidade>.public.notificacoes`.
-- **Motor analítico (Flink)**: `MotorAnalitico.java` consome os 3 tópicos via padrão de regex, extrai e normaliza as notificações, agrega por `doenca|tipo|cidade[|bairro]` usando `KeyedProcessFunction`, e publica as contagens no tópico `epidemiologia.alertas`.
-- **Dashboard em tempo real**: `server.py` consome o tópico de alertas e transmite as atualizações via WebSocket para o front-end, validado ponta a ponta — uma carga de teste inserida no Postgres aparece no dashboard em poucos segundos.
+```mermaid
+flowchart LR
+    PG1[("PostgreSQL<br/>Ponta Grossa")] --> DBZ
+    PG2[("PostgreSQL<br/>Curitiba")] --> DBZ
+    PG3[("PostgreSQL<br/>Castro")] --> DBZ
+    DBZ["Debezium Connect<br/>(CDC via WAL)"] --> RAW["Kafka<br/>epidemiologia_[cidade].public.notificacoes"]
+    RAW --> FLINK["Apache Flink<br/>MotorAnalitico"]
+    FLINK --> ALR["Kafka<br/>epidemiologia.alertas"]
+    ALR --> SRV["server.py<br/>(FastAPI)"]
+    SRV -- WebSocket --> UI["Dashboard<br/>no navegador"]
+    ALR --> COL["metrics_collector.py<br/>(medição de Le2e e throughput)"]
+```
 
-### ⚠️ Limitação conhecida (importante para reprodução dos testes)
+O fluxo tem quatro camadas lógicas:
 
-Nenhum serviço no `docker-compose.yml` usa **volumes persistentes**. Isso significa que **todo `docker compose down` apaga os dados do Postgres, do Kafka e os conectores registrados no Debezium**. Sempre que o ambiente for recriado do zero, é obrigatório rodar `ativar_cdc_debezium.py` novamente antes de gerar qualquer carga de teste — veja o passo a passo abaixo.
+1. **Origem e ingestão.** Os bancos legados recebem as notificações. O Debezium acompanha o WAL de cada banco e publica um evento JSON para cada inserção.
+2. **Transporte.** O Kafka recebe os eventos brutos, com um tópico por município, e desacopla a origem dos dados do processamento.
+3. **Inteligência.** O Flink consome os três tópicos, calcula a contagem de casos das últimas 24 horas por chave analítica e publica o resultado em um tópico de saída.
+4. **Ação e consumo.** Um servidor lê o tópico de saída e retransmite as contagens por WebSocket para o painel. Um coletor independente lê o mesmo tópico para medir latência e vazão.
 
 ---
 
-## 🛠️ Pré-requisitos
+## 3. Como o projeto funciona
 
-- **Docker Desktop** (mantenha o aplicativo aberto)
-- **Python 3.x** com `psycopg2-binary` (`pip install psycopg2-binary`)
-- **Java 11+** (para o Flink)
-- **Maven** — ou, alternativamente, o comando via Docker mostrado abaixo, que não exige instalação local
-- Git e um editor de código (ex: VS Code)
+### 3.1 Origem: os bancos legados simulados
+
+Cada município (Ponta Grossa, Curitiba e Castro) tem a sua própria instância do PostgreSQL, isolada das demais e configurada com `wal_level=logical`, requisito para a captura de mudanças. Cada instância recebe a mesma tabela, `notificacoes`, criada por `database/init.sql`:
+
+| Campo | Descrição |
+|---|---|
+| `id_notificacao` | Chave primária sequencial |
+| `dt_notificacao` | Data e hora do registro (`TIMESTAMP`, padrão `CURRENT_TIMESTAMP`) |
+| `dt_sintomas` | Data de início dos sintomas (`DATE`) |
+| `municipio_residencia`, `codigo_ibge`, `bairro` | Localização do caso |
+| `doenca` | `DENGUE`, `MENINGITE`, `INFLUENZA` ou `POPULAR` |
+| `cid_10` | Código CID-10 |
+| `idade`, `sexo`, `status_caso` | Dados do paciente e situação do caso |
+| `data_atualizacao` | Atualizada por trigger a cada `UPDATE` |
+
+A doença `POPULAR` representa os atendimentos gerais, sem relação com os agravos monitorados. Ela povoa o banco com um volume realista de ruído.
+
+### 3.2 Captura e transporte: CDC com Debezium e Kafka
+
+O script `ativar_cdc_debezium.py` registra no Debezium Connect três conectores, `sinan-postgres-ponta-grossa`, `sinan-postgres-curitiba` e `sinan-postgres-castro`. Cada um usa o plugin de replicação lógica `pgoutput` e monitora a tabela `public.notificacoes` do seu banco.
+
+A captura é **não intrusiva**: o Debezium lê o log de transações e não faz `SELECT` na tabela operacional. Cada inserção vira um evento JSON publicado em um tópico próprio do município:
+
+```
+epidemiologia_ponta_grossa.public.notificacoes
+epidemiologia_curitiba.public.notificacoes
+epidemiologia_castro.public.notificacoes
+```
+
+O envelope do Debezium traz, além dos dados da linha (`after`), o campo `source.ts_ms`: o instante de commit da transação no WAL do PostgreSQL, em UTC. Esse campo é a referência de origem usada na medição de latência (ver seção 4).
+
+### 3.3 Processamento: o motor analítico no Apache Flink
+
+O job `MotorAnalitico` (`flink-job/`, em Java) executa as etapas abaixo.
+
+**Consumo dos três tópicos.** O `KafkaSource` assina os tópicos por expressão regular (`epidemiologia_.*\.public\.notificacoes`) e reavalia os tópicos e partições a cada 10 segundos (`partition.discovery.interval.ms`). Sem essa propriedade, o Flink descobriria os tópicos uma única vez, no momento em que o job sobe.
+
+**Extração e normalização.** Cada mensagem do Debezium é decodificada e os campos de interesse são extraídos: município, código IBGE, bairro, doença, CID-10, identificador da notificação e o `source.ts_ms`. Textos são normalizados para maiúsculas, e registros sem município, código IBGE ou doença são descartados.
+
+**Tempo do evento (Event Time).** A agregação usa o tempo do evento, obtido de `dt_notificacao` (com `dt_sintomas` como alternativa) e convertido para milissegundos. A estratégia de watermarks tolera 1 minuto de desordem e marca fontes ociosas após 10 segundos, para que uma partição sem eventos não trave o avanço do tempo.
+
+**Chaves analíticas.** Cada notificação gera uma ou mais chaves de agregação:
+
+| Chave | Quando é gerada |
+|---|---|
+| `DOENCA\|CIDADE\|<codigo_ibge>` | Para toda notificação |
+| `DENGUE\|BAIRRO\|<codigo_ibge>\|<bairro>` | Adicionalmente, para dengue |
+
+Portanto, uma inserção de dengue produz dois alertas (cidade e bairro), e as demais doenças produzem um.
+
+**Contagem das últimas 24 horas com `KeyedProcessFunction`.** Para cada chave, o Flink mantém em estado a lista dos instantes das notificações que ainda pertencem à janela de 24 horas. Ao chegar uma notificação:
+
+1. o instante dela é adicionado ao estado da chave;
+2. um temporizador de Event Time é registrado para 24 horas depois, quando aquela notificação deve sair da contagem;
+3. a contagem atualizada é emitida imediatamente.
+
+Quando um temporizador dispara, as notificações vencidas são removidas do estado.
+
+**Por que não usar a janela deslizante nativa?** A primeira versão usava `SlidingEventTimeWindows` (24 horas com deslizamento de 10 segundos). Nessa configuração o Flink replica cada evento em `24 h ÷ 10 s = 8.640` janelas simultâneas. O resultado foi o crescimento excessivo de estado e a contrapressão sobre o Kafka, o que impedia a atualização em tempo real. A `KeyedProcessFunction` reconstrói a mesma semântica temporal, em que cada notificação permanece na contagem por 24 horas, mas mantém um único estado por chave e emite a contagem a cada evento, sem esperar o próximo intervalo de deslizamento.
+
+**Saída.** O job publica no tópico `epidemiologia.alertas` uma mensagem por evento processado:
+
+```json
+{
+  "chave": "DENGUE|CIDADE|4119905",
+  "doenca": "DENGUE",
+  "municipio": "PONTA GROSSA",
+  "codigo_ibge": "4119905",
+  "bairro": "CENTRO",
+  "tipo_agregacao": "CIDADE",
+  "quantidade_casos": 14,
+  "atualizado_em": "2026-09-15T22:40:12.345Z",
+  "origem_ts_ms": 1789425138548,
+  "id_ultima_notificacao": 87
+}
+```
+
+`quantidade_casos` é a contagem acumulada das últimas 24 horas para a chave. `origem_ts_ms` carrega o `source.ts_ms` do Debezium para a medição de latência. O job usa paralelismo 2, faz checkpoints a cada 20 segundos e publica no Kafka com entrega *at-least-once*.
+
+### 3.4 Consumo: o painel em tempo real
+
+O `dashboard/server.py` (FastAPI) tem duas responsabilidades:
+
+- **Consumir o tópico de alertas.** O consumidor não usa `group_id`: atribui as partições manualmente e, a cada inicialização, relê o tópico desde o início para reconstruir o estado, sem transmitir nada durante essa fase. Ao alcançar o fim do que já existia, passa a tratar cada mensagem nova como evento ao vivo. Assim o painel recupera os totais mesmo depois de reiniciado. O servidor aguarda o tópico existir sem limite de tentativas.
+- **Servir o painel via WebSocket.** Cada alerta novo é enviado aos navegadores conectados junto com as estatísticas atualizadas.
+
+Regras de contagem aplicadas pelo servidor:
+
+- Cada chave só é atualizada se a nova contagem for maior que a anterior. Isso descarta duplicatas e mensagens fora de ordem, consequência da entrega *at-least-once*.
+- Os totais usam apenas as chaves de nível `CIDADE`, para que o alerta de bairro da dengue não seja contado duas vezes.
+- O conceito de **rodada** permite repetir testes sem reiniciar nada: `POST /api/reset` registra os valores acumulados atuais como linha de base e zera o painel, que passa a exibir apenas os casos posteriores.
+
+O painel (`dashboard/index.html`) mostra o total de casos da rodada, o total por agravo, **um card por município** com o total e a contagem de cada doença, e um feed com as últimas contagens recebidas do Flink.
+
+Endpoints do servidor:
+
+| Rota | Descrição |
+|---|---|
+| `GET /` | Serve o painel |
+| `WS /ws` | Canal de atualizações em tempo real |
+| `GET /api/stats` | Estatísticas atuais |
+| `GET /api/alertas` | Últimas contagens recebidas |
+| `POST /api/reset` | Inicia uma nova rodada |
 
 ---
 
-## 🚀 Passo a passo completo (do zero até o dashboard ao vivo)
+## 4. Simulação de carga e medição
 
-Siga **exatamente nesta ordem** — a ordem importa por causa da limitação de volumes citada acima.
+O protótipo inclui o seu próprio ambiente de avaliação, que gera carga nos bancos legados e mede o que chega ao fim do fluxo.
 
-### 1. Subir a infraestrutura
+### 4.1 Geração de carga
 
-```bash
-cd infra
-docker compose up -d
+Os scripts em `simulator/` inserem notificações diretamente nos três bancos, com uma conexão por município. Cada um monta antes uma agenda com o instante, a cidade, a doença e o bairro de cada inserção, e depois a executa respeitando esses instantes. Os dois cenários comprimem **24 horas de notificações em 5 minutos de execução** (fator aproximado de 288×). Os volumes foram calibrados em escala reduzida, a partir de dados públicos de notificações do Sinan cruzados com o total de atendimentos do TabNet.
+
+| Cenário | Script | Volume | Distribuição |
+|---|---|---|---|
+| Rotina | `basal.py` | 3.367 eventos (Ponta Grossa 372, Curitiba 2.979, Castro 16) | Aleatória ao longo dos primeiros 240 s do ciclo de 300 s |
+| Surto | `surto.py` | 33.683 eventos (Ponta Grossa 3.725, Curitiba 29.796, Castro 162), ou seja, 10× a rotina | Uniforme ao longo de 95% do ciclo (carga sustentada ampliada, sem pico concentrado) |
+
+Ambos aceitam `--seed` para execuções reproduzíveis e `--duracao` para alterar o ciclo. O `auditoria.py` insere um lote pequeno e controlado de casos e imprime o resumo do que foi enviado. Serve para conferir a contagem no painel.
+
+### 4.2 Métricas
+
+O `simulator/metrics_collector.py` é um consumidor Kafka independente do painel. Ele lê o tópico `epidemiologia.alertas` sem `group_id`, atribui as partições manualmente e se posiciona no fim do tópico, de modo que cada execução mede apenas os eventos gerados a partir daquele instante.
+
+- **Latência ponta a ponta (Le2e)** = instante de recebimento no coletor − `origem_ts_ms`. O `origem_ts_ms` é o `source.ts_ms` do Debezium, o instante de commit no WAL, em UTC, que não depende de conversão de fuso horário.
+- **Evento** = uma inserção no banco. Cada inserção gera exatamente um alerta de nível `CIDADE`, e só eles entram na latência e no throughput. Os alertas de `BAIRRO` (dengue) são contados à parte.
+- **Throughput** = eventos `CIDADE` recebidos ÷ duração real da coleta.
+- **Estatísticas de latência:** média, mediana, P95, P99, mínimo e máximo, calculadas sobre todas as amostras da execução.
+
+Saídas geradas por execução:
+
+| Arquivo | Conteúdo |
+|---|---|
+| `metricas_coletadas.csv` | Uma linha por segundo: eventos, alertas de bairro e estatísticas de latência da janela |
+| `latencias_amostras.csv` | Uma linha por evento, com a latência individual e os instantes de origem e chegada |
+| `resultados_performance_final.xlsx` | Os dois CSVs reunidos em abas (gerado quando `pandas` e `openpyxl` estão instalados) |
+
+---
+
+## 5. Como executar o pipeline completo
+
+Os comandos abaixo são para PowerShell no Windows. Cada terminal começa na **raiz do repositório**, e as etapas 1 e 2 deixam um terminal ocupado cada, então use um terminal por etapa.
+
+### Pré-requisitos
+
+- Docker Desktop em execução.
+- Python 3 com as dependências do painel, dos geradores de carga e do coletor:
+
+  ```powershell
+  pip install fastapi uvicorn kafka-python psycopg2-binary
+  pip install pandas openpyxl    # opcional: gera o .xlsx com os resultados da medição
+  ```
+
+- Permissão para executar scripts `.ps1`. Se o Windows bloquear, rode uma vez:
+
+  ```powershell
+  Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+  ```
+
+### Passo 1: infraestrutura, CDC e job do Flink (terminal 1)
+
+```powershell
+.\subir-job.ps1 -Infra
 ```
 
-Aguarde cerca de 1-2 minutos para todos os containers ficarem saudáveis. Confira com:
+O script sobe os containers, espera o Flink e o Debezium ficarem prontos, registra os três conectores de CDC (se ainda não existirem), compila o motor analítico com Maven em um container e submete o job ao Flink. As tabelas dos três bancos são criadas automaticamente na primeira subida, a partir de `database/init.sql`.
 
-```bash
-docker ps
-```
+A primeira execução demora mais, porque baixa as imagens e as dependências do Maven. As seguintes usam o cache. O fim bem-sucedido é indicado por `Job 'Motor Analitico Epidemiologico' RUNNING`, e o estado do job também pode ser conferido em http://localhost:8081.
 
-Você deve ver 8 containers: `postgres-ponta-grossa` (porta 5433), `postgres-curitiba` (5434), `postgres-castro` (5435), `zookeeper`, `kafka` (9092), `debezium-connect` (8083), `flink-jobmanager` (8081) e `flink-taskmanager`.
+### Passo 2: painel em tempo real (terminal 2)
 
-### 2. Ativar o CDC (Debezium)
-
-Na raiz do projeto:
-
-```bash
-python ativar_cdc_debezium.py
-```
-
-Confirme que os 3 conectores foram criados e estão rodando:
-
-```bash
-curl http://localhost:8083/connectors
-curl http://localhost:8083/connectors/sinan-postgres-ponta-grossa/status
-curl http://localhost:8083/connectors/sinan-postgres-curitiba/status
-curl http://localhost:8083/connectors/sinan-postgres-castro/status
-```
-
-Cada resposta deve trazer `"state":"RUNNING"` tanto no `connector` quanto em cada `task`.
-
-### 3. Compilar o job Flink
-
-Sem precisar instalar o Maven na máquina, use o container oficial:
-
-```bash
-cd flink-job
-docker run --rm -v "${PWD}:/app" -w /app maven:3.8.6-openjdk-11 mvn clean package -DskipTests
-```
-
-Confirme o jar gerado (o nome correto **não** tem o prefixo `original-`):
-
-```bash
-dir target\*.jar        # Windows (PowerShell)
-ls target/*.jar         # Linux/Mac
-```
-
-### 4. Submeter o job ao cluster Flink
-
-```bash
-docker cp target/motor-analitico-epidemiologico-1.0-SNAPSHOT.jar flink-jobmanager:/opt/flink/motor-analitico.jar
-docker exec -it flink-jobmanager flink run -c br.edu.tcc.MotorAnalitico /opt/flink/motor-analitico.jar
-```
-
-Confirme na Web UI (`http://localhost:8081`) que o job aparece em **Running Jobs**, sem exceções na aba **Exceptions**.
-
-### 5. Subir o dashboard
-
-Em um novo terminal:
-
-```bash
+```powershell
 cd dashboard
 python server.py
 ```
 
-Acesse `http://localhost:8501` no navegador.
+Abra http://localhost:8501 no navegador. O servidor espera o tópico `epidemiologia.alertas`, que só passa a existir quando o Flink publica o primeiro alerta. Enquanto isso, ele imprime `[Kafka]Aguardando o tópico...` e começa a escutar sozinho assim que o tópico aparece. A mensagem `[Kafka] Consumer ao vivo` indica que o painel está pronto.
 
-### 6. Gerar carga de teste
+### Passo 3: gerar carga nos bancos legados (terminal 3)
 
-Em outro terminal:
+Para uma conferência rápida, o `auditoria.py` insere 30 casos distribuídos entre as cidades e imprime o resumo do que enviou:
 
-```bash
+```powershell
 cd simulator
-python auditoria.py       # carga controlada (30 casos, ótimo para validação rápida)
-# ou
-python gerador.py         # carga contínua, para testes mais longos
+python auditoria.py
 ```
 
-### 7. Verificar
+Para os cenários completos (24 horas simuladas em 5 minutos):
 
-O dashboard deve atualizar em poucos segundos, refletindo os novos casos por doença/cidade. Para inspecionar os eventos brutos no Kafka a qualquer momento:
-
-```bash
-docker exec -it kafka kafka-console-consumer --bootstrap-server localhost:9092 --topic epidemiologia_ponta_grossa.public.notificacoes --from-beginning
-docker exec -it kafka kafka-console-consumer --bootstrap-server localhost:9092 --topic epidemiologia.alertas --from-beginning
+```powershell
+python basal.py     # Cenário Rotina
+python surto.py     # Cenário Surto (10x o volume da Rotina)
 ```
 
----
+Os dois aceitam `--seed 42` (execução reproduzível) e `--duracao 60` (ciclo mais curto). Ao final, cada script mostra quantos registros foram inseridos por cidade. Em uma rodada iniciada com o painel zerado, o total exibido no painel deve corresponder ao total inserido.
 
-## 🔄 Reiniciando o ambiente do zero
+### Passo 4: medir latência e throughput (opcional)
 
-Como não há volumes persistentes, sempre que os containers forem recriados (`docker compose down` seguido de `up`), repita a partir do **passo 2** (ativar o CDC) antes de submeter o job ou gerar carga. Resumo rápido:
+O coletor se posiciona no fim do tópico de alertas e mede apenas os eventos gerados a partir daquele instante. Por isso, **inicie o coletor primeiro e o gerador logo em seguida**. Se o tópico ainda não existir, o coletor aguarda por cerca de 60 segundos.
 
-```bash
-cd infra && docker compose up -d
-python ativar_cdc_debezium.py          # obrigatório a cada reset
-# recompilar/resubmeter o job Flink (passos 3 e 4)
-# subir o dashboard (passo 5)
-# gerar carga (passo 6)
+Terminal 3, o coletor (305 s = 300 s do ciclo + 5 s de margem para os últimos eventos chegarem):
+
+```powershell
+cd simulator
+python metrics_collector.py --duracao 305
 ```
 
-## 🛑 Como desligar o ambiente
+Terminal 4, logo em seguida, o gerador:
 
-```bash
-cd infra
-docker compose down
+```powershell
+cd simulator
+python basal.py     # ou surto.py
 ```
 
-(Lembre-se: isso apaga todos os dados e conectores, pelos motivos explicados acima.)
+Ao final, o coletor imprime o resumo no console (throughput, média, mediana, P95, P99, mínimo e máximo) e grava `metricas_coletadas.csv`, `latencias_amostras.csv` e `resultados_performance_final.xlsx` no diretório de execução.
 
----
+### Passo 5: repetir execuções
 
-## 🐛 Troubleshooting — lições aprendidas durante o desenvolvimento
+Para outra rodada, sem recriar o ambiente, zere o painel:
 
-| Sintoma                                                           | Causa                                                                                                                                                                                                                                                                                                                      | Solução                                                                                                                                     |
-| ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| Job Flink "RUNNING" mas dashboard nunca atualiza                  | O `KafkaSource` descobre tópicos que casam com o padrão regex **uma única vez**, no instante em que o job sobe. Se o Debezium ainda não tiver criado os tópicos nesse momento, o job nunca mais os encontra                                                                                                                | Adicionado `.setProperty("partition.discovery.interval.ms", "10000")` no `MotorAnalitico.java` — reavalia tópicos/partições a cada 10s      |
-| `kafka-consumer-groups --describe` retorna "group does not exist" | Sem nenhuma partição atribuída (pelo motivo acima), o consumer nunca chega a commitar offset, então o grupo nunca é criado no Kafka                                                                                                                                                                                        | Mesma correção acima; também ajuda usar um `GROUP_ID` novo ao depurar, para eliminar dúvidas sobre offsets antigos                          |
-| Dashboard nunca aparece nada mesmo com o Kafka recebendo dados    | Debezium não estava ativado após um reset do ambiente (containers recriados sem volumes)                                                                                                                                                                                                                                   | Sempre rodar `ativar_cdc_debezium.py` logo após subir os containers, antes de qualquer outra etapa                                          |
-| Contagens no dashboard "travadas" e nunca caem, mesmo após 24h    | O `server.py` tem uma trava anti-oscilação (`deve_emitir_alerta`) que só aceita atualizações com contagem **maior** que a anterior — pensada para a versão antiga (janelas sobrepostas fora de ordem), mas incompatível com a nova lógica, em que a contagem pode legitimamente cair quando casos expiram da janela de 24h | Ajustar `deve_emitir_alerta` para aceitar atualizações mais recentes por timestamp, não apenas por contagem crescente (ver próximos passos) |
+```powershell
+Invoke-RestMethod -Method Post http://localhost:8501/api/reset
+```
 
----
+O Flink continua em execução e mantém as contagens acumuladas das últimas 24 horas. O `reset` faz o painel exibir somente os casos posteriores a ele. Cada nova execução do coletor já começa no fim do tópico, sem herdar dados da anterior.
 
-## 🎯 Próximos passos
+Se o código do motor analítico for alterado, recompile e republique o job sem mexer na infraestrutura:
 
-1. **Corrigir a trava anti-oscilação do `server.py`** para refletir corretamente quedas legítimas de contagem quando casos saem da janela de 24h.
-2. **Validar o `metrics_collector.py`** e formalizar a coleta dos KPIs definidos na metodologia do TCC:
-   - **Latência ponta a ponta (Le2e)**: tempo entre a inserção no Postgres e a chegada do alerta processado no dashboard.
-   - **Throughput**: eventos processados por segundo sob carga.
-3. **Executar os cenários de teste da seção 3.4**:
-   - _Cenário Basal_: fluxo linear e homogêneo de notificações.
-   - _Cenário de Surto_: injeção abrupta de registros para estressar a vazão da arquitetura (pode exigir escalar o `flink-taskmanager` via `docker compose up -d --scale flink-taskmanager=2` para aumentar os task slots disponíveis).
-4. **Adicionar volumes persistentes** ao `docker-compose.yml` (opcional, mas recomendado) para não perder dados/conectores a cada reinicialização durante o desenvolvimento.
-5. **Documentar os resultados** comparando a implementação original (`SlidingEventTimeWindows`) com a atual (`KeyedProcessFunction`) em termos de latência e uso de estado, para a seção de resultados do TCC.
+```powershell
+.\subir-job.ps1
+```
 
+O script aceita `-SkipBuild` (só reenvia o jar já compilado) e `-SkipCdc` (não verifica os conectores Debezium).
 
+### Verificação opcional
 
-README MURILO // VERSÃO 23/09 (após ajustes de inserções com escalas corretas)
-
-GUIA DE EXECUÇÃO DA POC — SISTEMA DE VIGILÂNCIA EPIDEMIOLÓGICA EM TEMPO REAL
-
-Manual Operacional de Validação de Ponta a Ponta no Ambiente Windows (PowerShell)
-
-23 de setembro de 2026
-
-1. Pré-requisitos do Ambiente
-Esta seção estabelece os componentes de software necessários para a reprodução integral da Prova de Conceito (PoC). O fluxo operacional dispensa a instalação local de Java Development Kit (JDK) ou Apache Maven no sistema hospedeiro, uma vez que o processo de compilação do artefato do Apache Flink é inteiramente encapsulado em contêineres Docker.
-
-1.1 Softwares Necessários
-Sistema Operacional: Microsoft Windows 10 ou 11 (64-bit) com terminal PowerShell 5.1 ou superior.
-Docker Desktop: Instalado e em execução com suporte a contêineres Linux (WSL 2 backend).
-Git: Cliente de versionamento distribuído configurado no PATH.
-Python: Versão 3.10 ou superior instalada no hospedeiro.
-1.2 Verificação do Docker Desktop
-Antes de iniciar os procedimentos, certifique-se de que a interface de integração do daemon Docker está acessível:
-
-powershell
-
-
-docker version
-Saída esperada:
-
-text
-
-
-Client:<br/>
- Version:           24.0.7<br/>
- API version:       1.43
- ...
-Server: Docker Desktop<br/>
- Engine:<br/>
-  Version:          24.0.7<br/>
-  API version:      1.43
-Critério de aprovação: Exibição bem-sucedida das seções Client e Server sem exceções de conexão nomeada de canal (named pipe).
-
-1.3 Instalação de Dependências Python
-Execute a instalação das bibliotecas requeridas para a execução do simulador de carga, conectores de banco e interface analítica:
-
-powershell
-
-
-pip install psycopg2-binary fastapi uvicorn websockets kafka-python
-Critério de aprovação: Mensagem Successfully installed ou Requirement already satisfied para todos os pacotes requisitados.
-
-2. Passo 1 — Inicialização da Infraestrutura Distribuída
-A topologia base compreende instâncias isoladas de bancos de dados relacionais transacionais (PostgreSQL) para três municípios paranaenses, mensageria distribuída (Apache Kafka e Apache Zookeeper), motor de captura de dados alterados (Debezium Connect) e infraestrutura de processamento de fluxo (Apache Flink JobManager e TaskManager).
-
-Atenção: A configuração do Compose não utiliza volumes persistentes mapeados para o disco rígido do hospedeiro. O comando docker compose down expurga completamente os registros dos bancos e tópicos Kafka, exigindo a reinscrição dos conectores CDC no Debezium.
-
-2.1 Atualização de Código e Subida dos Contêineres
-powershell
-
-
-cd C:\Users\muril\Documents\TCC
-git pull origin multi-databases
-cd C:\Users\muril\Documents\TCC\infra
-docker compose up -d
-2.2 Verificação de Saúde dos Contêineres
-powershell
-
-
-docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
-Saída esperada:
-
-text
-
-
-NAMES                   STATUS                        PORTS
-kafka                   Up About a minute             0.0.0.0:9092->9092/tcp, [::]:9092->9092/tcp
-zookeeper               Up About a minute             2181/tcp, 2888/tcp, 3888/tcp
-postgres-ponta-grossa   Up About a minute (healthy)   0.0.0.0:5433->5432/tcp, [::]:5433->5432/tcp<br/>
-postgres-curitiba       Up About a minute (healthy)   0.0.0.0:5434->5432/tcp, [::]:5434->5432/tcp<br/>
-postgres-castro         Up About a minute (healthy)   0.0.0.0:5435->5432/tcp, [::]:5435->5432/tcp<br/>
-debezium-connect        Up About a minute             0.0.0.0:8083->8083/tcp, [::]:8083->8083/tcp<br/>
-flink-jobmanager        Up About a minute             0.0.0.0:8081->8081/tcp, [::]:8081->8081/tcp
-flink-taskmanager       Up About a minute             6123/tcp, 8081/tcp
-Critério de aprovação: Exatamente 8 contêineres em estado Up, com as 3 bases PostgreSQL reportando (healthy). Eventual aviso sobre contêiner órfão postgres-legado deve ser ignorado.
-
-Nota: Aguarde 120 segundos para que o framework Java interno do Debezium Connect conclua o provisionamento da porta REST 8083.
-
-3. Passo 2 — Ativação e Validação do CDC (Debezium)
-O conector CDC realiza a extração de dados contínua baseada em leitura direta do log de escrita prévia (Write-Ahead Log — WAL) do PostgreSQL, propagando as notificações municipais em tópicos de granularidade única.
-
-3.1 Verificação da Interface REST do Conector
-powershell
-
-
+```powershell
+# conectores do Debezium registrados
 Invoke-RestMethod http://localhost:8083/connectors
-Critério de aprovação: A API deve responder com código HTTP 200, retornando um array (vazio ou com inscrições preexistentes), sem lançar falha de conexão.
 
-3.2 Registro dos Conectores Municipais
-powershell
+# últimas mensagens publicadas pelo Flink
+docker exec -it kafka kafka-console-consumer --bootstrap-server localhost:9092 --topic epidemiologia.alertas --from-beginning --max-messages 5
+```
 
+### Encerrar
 
-cd C:\Users\muril\Documents\TCC
-python ativar_cdc_debezium.py
-3.3 Inspeção de Estado das Tarefas dos Conectores
-powershell
+Pare o painel com `Ctrl+C` e derrube os containers:
 
+```powershell
+docker compose -f infra/docker-compose.yml down
+```
 
-$conectores = Invoke-RestMethod http://localhost:8083/connectors
-foreach ($c in $conectores) {
-    $r = Invoke-RestMethod "http://localhost:8083/connectors/$c/status"<br/>
-    "$c  ->  $($r.connector.state)  |  tasks: $($r.tasks.state -join ',')"
-}
-Saída esperada:
+Como o ambiente não usa volumes persistentes, isso remove os dados, os tópicos e os conectores. Ao subir de novo, execute o passo 1 outra vez: o script registra os conectores novamente.
 
-text
+---
 
+## 6. Componentes e portas
 
-sinan-postgres-connector  ->  RUNNING  |  tasks: FAILED<br/>
-sinan-postgres-castro     ->  RUNNING  |  tasks: RUNNING<br/>
-sinan-postgres-curitiba   ->  RUNNING  |  tasks: RUNNING<br/>
-sinan-postgres-ponta-grossa ->  RUNNING  |  tasks: RUNNING
-Critério de aprovação: Os conectores sinan-postgres-castro, sinan-postgres-curitiba e sinan-postgres-ponta-grossa devem estar estritamente em RUNNING tanto no conector quanto nas tasks. O conector legado sinan-postgres-connector com tarefas em FAILED é inofensivo.
+| Serviço | Container | Porta no host |
+|---|---|---|
+| PostgreSQL, Ponta Grossa | `postgres-ponta-grossa` | 5433 |
+| PostgreSQL, Curitiba | `postgres-curitiba` | 5434 |
+| PostgreSQL, Castro | `postgres-castro` | 5435 |
+| Zookeeper | `zookeeper` | — |
+| Apache Kafka | `kafka` | 9092 (host) e 29092 (rede interna) |
+| Debezium Connect | `debezium-connect` | 8083 |
+| Flink JobManager (UI e API REST) | `flink-jobmanager` | 8081 |
+| Flink TaskManager (2 slots) | `flink-taskmanager` | — |
+| Painel (FastAPI) | processo local | 8501 |
 
-3.4 Confirmação dos Tópicos no Apache Kafka
-powershell
+O Kafka expõe dois endereços: `kafka:29092` para a comunicação entre containers (Flink e Debezium) e `localhost:9092` para os processos executados no host (painel e coletor).
 
+O script `subir-job.ps1` automatiza o ciclo de publicação do job. Ele verifica os containers e o Flink, garante que os três conectores Debezium estejam registrados e em execução (invocando `ativar_cdc_debezium.py` quando faltam), compila o projeto com Maven em um container (sem exigir Maven instalado na máquina), cancela jobs anteriores pela API REST do Flink, envia o jar ao JobManager e submete o novo job em modo *detached*.
 
-docker exec kafka kafka-topics --bootstrap-server kafka:29092 --list
-Critério de aprovação: Presença confirmada de:
+---
 
-epidemiologia_curitiba.public.notificacoes
-epidemiologia_ponta_grossa.public.notificacoes
-epidemiologia_castro.public.notificacoes
-epidemiologia.alertas
-4. Passo 3 — Inspeção Estática e Compilação do Artefato Java
-Para mitigar as instabilidades de consumo e falhas de retenção de janelas anteriores, o componente analítico adota processamento com retenção explícita de estado via KeyedProcessFunction e registro controlado por identificador de grupo versionado.
+## 7. Decisões de projeto
 
-4.1 Validação Estrutural do Código-Fonte
-powershell
-
-
-cd C:\Users\muril\Documents\TCC
-Get-ChildItem .\flink-job\src -Recurse -Filter *.java | Select-String -Pattern "KeyedProcessFunction|enableCheckpointing|setCheckpointStorage|FileSystemCheckpointStorage|GROUP_ID"
-Critério de aprovação: Confirmação da importação da classe KeyedProcessFunction, invocação do método enableCheckpointing(60000) e atribuição de GROUP_ID = "motor-analitico-epidemiologico-v2".
-
-4.2 Compilação Isolada via Contêiner Docker
-powershell
-
-
-cd C:\Users\muril\Documents\TCC\flink-job<br/>
-docker run --rm -v "${PWD}:/usr/src/app" -w /usr/src/app maven:3.9-eclipse-temurin-17 mvn clean package -DskipTests
-Critério de aprovação: Finalização do processo com a mensagem conclusiva [INFO] BUILD SUCCESS.
-
-Nota Técnica: Tratamento de Caractere Oculto (BOM): Se a compilação falhar com o erro illegal character: '\ufeff', execute no PowerShell a remoção da marca d'água UTF-8 gerada por editores Windows e recompile:
-
-powershell
-
-
-$path = ".\src\main\java\br\edu\tcc\MotorAnalitico.java"
-$content = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
-if ($content[0] -eq [char]0xFEFF) {
-    $content = $content.Substring(1)
-    [System.IO.File]::WriteAllText($path, $content, [System.Text.UTF8Encoding]::new($false))
-}
-4.3 Confirmação do Pacote Gerado
-powershell
-
-
-Get-ChildItem .\target\*.jar | Select-Object Name, Length, LastWriteTime
-Critério de aprovação: Geração do arquivo motor-analitico-epidemiologico-1.0-SNAPSHOT.jar (fat JAR com dependências) com tamanho aproximado de 2,8 MB (2.799.576 bytes). O arquivo de prefixo original-* (14 KB) não deve ser utilizado.
-
-5. Passo 4 — Submissão do Job ao Cluster Apache Flink
-O envio do pacote compilado ao Flink JobManager é realizado por chamadas REST multipart, seguido pelo acionamento assíncrono do grafo de execução.
-
-5.1 Envio do Artefato Binário
-powershell
-
-
-cd C:\Users\muril\Documents\TCC\flink-job<br/>
-curl.exe -sS -X POST -H "Expect:" -F "jarfile=@target/motor-analitico-epidemiologico-1.0-SNAPSHOT.jar" http://localhost:8081/jars/upload
-Saída esperada:
-
-json
-
-
-{"filename":"/tmp/flink-web-upload/42515378-136d-4a51-93be-28b3259ddc27_motor-analitico-epidemiologico-1.0-SNAPSHOT.jar","status":"success"}
-5.2 Disparo do Grafo de Operadores
-Isole exclusivamente o nome do arquivo gerado no campo filename (removendo o prefixo de diretório):
-
-powershell
-
-
-$jarId = "42515378-136d-4a51-93be-28b3259ddc27_motor-analitico-epidemiologico-1.0-SNAPSHOT.jar"
-curl.exe -sS -X POST "http://localhost:8081/jars/$jarId/run?entry-class=br.edu.tcc.MotorAnalitico&parallelism=1"
-Saída esperada:
-
-json
-
-
-{"jobid":"8219b18c6027c484b202f3495b90c3ca"}
-5.3 Validação de Registro do Job
-powershell
-
-
-Invoke-RestMethod http://localhost:8081/jobs/overview
-Critério de aprovação: Localização do job Motor Analitico Epidemiologico em estado operacional RUNNING. Armazene o identificador alfanumérico retornado na variável $jobId.
-
-6. Passo 5 — Auditoria de Saúde: Checkpoints e Retenção Kafka
-Esta etapa audita os mecanismos de tolerância a falhas do pipeline, garantindo que o acúmulo de estado assíncrono não degrade a integridade do nó executor.
-
-6.1 Auditoria Quantitativa de Checkpoints
-Aguarde 180 segundos a partir do provisionamento e consulte o coordenador:
-
-powershell
-
-
-$jobId = "8219b18c6027c484b202f3495b90c3ca"
-curl.exe -sS "http://localhost:8081/jobs/$jobId/checkpoints" | ConvertFrom-Json | Select-Object -ExpandProperty counts
-Saída esperada:
-
-text
-
-
-restored    : 0<br/>
-total       : 2<br/>
-in_progress : 0<br/>
-completed   : 2<br/>
-failed      : 0
-Critério de aprovação: Valor de completed estritamente superior a zero e índice cumulativo de failed igual a zero.
-
-6.2 Monitoramento do Grupo Consumidor
-powershell
-
-
-docker exec kafka kafka-consumer-groups --bootstrap-server kafka:29092 --describe --group motor-analitico-epidemiologico-v2
-Saída esperada:
-
-text
-
-
-Consumer group 'motor-analitico-epidemiologico-v2' has no active members.
-
-GROUP                             TOPIC                                          PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
-motor-analitico-epidemiologico-v2 epidemiologia_castro.public.notificacoes       0          949             949             0
-motor-analitico-epidemiologico-v2 epidemiologia_curitiba.public.notificacoes     0          1403            1403            0
-motor-analitico-epidemiologico-v2 epidemiologia_ponta_grossa.public.notificacoes 0          1291            1291            0
-Critério de aprovação: Diferencial de retardo (LAG) estritamente igual a 0 em todas as partições. O estado has no active members é padrão e esperado para a implementação nativa de KafkaSource orientada a checkpoints do Apache Flink.
-
-7. Passo 6 — Injeção de Carga Sintética e Detecção de Surtos
-O gerador sintético injeta uma distribuição realista de notificações com coordenadas e carimbos temporais, intercalando eventos de rotina com anomalias propositais para validação dos filtros analíticos.
-
-7.1 Captura de Linha de Base dos Offsets
-Execute a medição prévia de posição absoluta nos tópicos analíticos:
-
-powershell
-
-
-docker exec kafka kafka-run-class kafka.tools.GetOffsetShell --broker-list kafka:29092 --topic epidemiologia.alertas --time -1<br/>
-docker exec kafka kafka-run-class kafka.tools.GetOffsetShell --broker-list kafka:29092 --topic epidemiologia.contagens --time -1
-Saída de referência:
-
-text
-
-
-epidemiologia.alertas:0:26148<br/>
-epidemiologia.alertas:1:24474<br/>
-epidemiologia.alertas:2:30866<br/>
-epidemiologia.contagens:0:77265
-7.2 Execução do Módulo Simulador
-powershell
-
-
-cd C:\Users\muril\Documents\TCC
-python .\simulator\gerador.py
-Saída esperada:
-
-text
-
-
-Ciclo de 300s = 24h simuladas | 3516 notificacoes (3491 de preenchimento)
-Surto planejado: 3 casos de MENINGITE em Castro (bairro ancora: CENTRO)
-
-[1/3] SURTO MENINGITE -> Castro (bairro: MOCAMINHO)<br/>
-[2/3] SURTO MENINGITE -> Castro (bairro: VILA ISA)<br/>
-[3/3] SURTO MENINGITE -> Castro (bairro: COHAB)
-
-Fim do ciclo: 3516/3516 inseridos | Surto de MENINGITE: 3/3 casos injetados em Castro
-7.3 Verificação de Gravação Transacional
-powershell
-
-
-docker exec postgres-curitiba psql -U postgres -d sinan_db -c "SELECT COUNT(*) FROM public.notificacoes;"
-Critério de aprovação: Contagem de registros superior a 4.000 linhas no banco sinan_db de Curitiba, confirmando inserção efetiva.
-
-7.4 Avaliação de Incremento no Kafka
-Reexecute a inspeção de offsets:
-
-powershell
-
-
-docker exec kafka kafka-run-class kafka.tools.GetOffsetShell --broker-list kafka:29092 --topic epidemiologia.alertas --time -1
-Saída esperada após carga:
-
-text
-
-
-epidemiologia.alertas:0:27358<br/>
-epidemiologia.alertas:1:25524<br/>
-epidemiologia.alertas:2:32123
-Critério de aprovação: Diferencial positivo estrito em relação à linha de base em todas as partições do tópico epidemiologia.alertas.
-
-7.5 Leitura Dirigida de Alertas e Validação de Formato
-Consuma os dados gerados utilizando a posição da linha de base como offset de partida:
-
-powershell
-
-
-docker exec kafka kafka-console-consumer --bootstrap-server kafka:29092 --topic epidemiologia.alertas --partition 0 --offset 26148 --timeout-ms 30000 --max-messages 5
-Estrutura JSON validada:
-
-json
-
-
-{"doenca":"POPULAR","atualizado_em":"2026-09-23T23:23:03.155288Z","municipio":"CURITIBA","bairro":"CENTRO","chave":"POPULAR|CIDADE|4106902","codigo_ibge":"4106902","tipo_agregacao":"CIDADE","quantidade_casos":1}
-7.6 Confirmação da Regra Epidemiológica do Surto
-Filtre os registros analíticos do surto induzido na partição correspondente:
-
-powershell
-
-
-docker exec kafka kafka-console-consumer --bootstrap-server kafka:29092 --topic epidemiologia.alertas --partition 0 --offset 26148 --timeout-ms 30000 --max-messages 2000 | Select-String "MENINGITE" | Select-Object -First 5
-Saída esperada:
-
-json
-
-
-{"doenca":"MENINGITE","atualizado_em":"2026-09-23T23:27:50.737859Z","municipio":"CASTRO","bairro":"COHAB","chave":"MENINGITE|CIDADE|4104153","codigo_ibge":"4104153","tipo_agregacao":"CIDADE","quantidade_casos":3}
-Critério de aprovação: Identificação de mensagem com municipio: "CASTRO", doenca: "MENINGITE" e quantidade_casos: 3, atestando a detecção exata dos 3 eventos injetados pelo simulador.
-
-8. Passo 7 — Visualização Analítica no Dashboard em Tempo Real
-A camada de apresentação compreende um serviço desacoplado que ingere eventos analíticos do Kafka via consumidor interno e disponibiliza agregados via WebSocket e endpoints HTTP REST.
-
-8.1 Inicialização do Servidor (Terminal 1)
-Abra uma janela exclusiva do PowerShell e inicialize o serviço:
-
-powershell
-
-
-cd C:\Users\muril\Documents\TCC
-python .\dashboard\server.py
-Saída esperada no console:
-
-text
-
-
-INFO:     Started server process [13828]<br/>
-INFO:     Application startup complete.<br/>
-INFO:     Uvicorn running on http://0.0.0.0:8501 (Press CTRL+C to quit)
-[Kafka] Consumer iniciado — aguardando contagens do Flink...
-8.2 Consulta à API de Estatísticas (Terminal 2)
-Em um terminal paralelo, audite o endpoint de extração:
-
-powershell
-
-
-Invoke-RestMethod http://localhost:8501/api/stats
-8.3 Interface de Usuário
-Acesse pelo navegador web o endereço http://localhost:8501.
-
-Critérios de aprovação:
-
-Disponibilidade operacional do serviço HTTP respondendo na porta 8501.
-Agrupamento estrito de municípios sob caixa única normalizada (CURITIBA, CASTRO, PONTA GROSSA), eliminando duplicatas.
-Exibição do registro de MENINGITE em Castro com contagem consolidada igual a 3.
-Atualização reativa dos componentes gráficos sem necessidade de recarregamento manual de página via WebSocket.
-9. Sumário Executivo de Validação Operacional (23/09/2026)
-A execução consolidada em 23 de setembro de 2026 homologou a robustez da arquitetura de fluxo contínuo implementada, comprovando sua viabilidade técnica para observabilidade em saúde pública.
-
-Parâmetro de Auditoria	Comportamento Anterior (Job Legado)	Resultado Homologado (Motor v2)
-Estratégia de Janelamento	SlidingEventTimeWindows (24h/5min)	KeyedProcessFunction com Retenção de Estado
-Estabilidade de Checkpoints	137 falhas consecutivas em 158 disparos	33 checkpoints concluídos com sucesso (0 falhas)
-Tamanho de Estado Serializado	~24 MB (estouro do limite de memória de 5 MB)	< 500 KB (compatível com retenção em memória)
-Vazão sob Carga Agrupada	Operadores reiniciados em loop (attempt 161+)	3.516 eventos absorvidos sem backpressure
-Retardo de Consumo (Kafka LAG)	Acúmulo de 660 mensagens represadas	LAG 0 em todos os tópicos particionados
-Normalização Territorial	Entradas divergentes ("Curitiba" vs "CURITIBA")	Padronização consistente via toUpperCase()
-Sensibilidade a Surtos	Indeterminado por travamento do grafo analítico	Detecção exata de surto (3 casos de Meningite)
-10. Guia Rápido de Solução de Problemas (Troubleshooting)
-Catálogo de comportamentos anômalos comuns durante o ciclo de implantação e seus respectivos planos de contenção imediata.
-
-10.1 Falha de Comunicação com Daemon Docker (npipe)
-Sintoma: failed to connect to the docker API at npipe:////./pipe/dockerDesktopLinuxEngine.
-Causa: Processo em segundo plano do Docker Desktop inativo ou motor WSL 2 finalizado.
-Ação Corretiva: Inicie o Docker Desktop pelo atalho do sistema e execute repetidamente docker version até que o bloco Server seja reportado.
-10.2 Conector Legado em Estado Falho (sinan-postgres-connector)
-Sintoma: Verificação do Debezium reporta sinan-postgres-connector -> RUNNING | tasks: FAILED.
-Causa: Resquício de metadados buscando a instância extinta postgres-legado.
-Ação Corretiva: Inofensivo para a execução atual. Caso deseje limpar o conector do catálogo, execute: curl.exe -X DELETE http://localhost:8083/connectors/sinan-postgres-connector.
-10.3 Falha de Checkpoint Assíncrono (Asynchronous task checkpoint failed)
-Sintoma: Consulta ao Flink indica status: FAILED e mensagem Size of the state is larger than the maximum permitted memory-backed state.
-Causa: Utilização de MemoryStateBackend padrão com estado cumulativo excedendo o teto de 5.242.880 bytes (5 MB).
-Ação Corretiva: A migração para KeyedProcessFunction suprime este problema por manter o estado compacto. Para volumes de produção, configure persistência externa via FileSystemCheckpointStorage("file:///opt/flink/checkpoints") com montagem de volume mapeado entre JobManager e TaskManager no docker-compose.yml.
-10.4 Erro de Conexão na Consulta REST do Dashboard
-Sintoma: Invoke-RestMethod : Impossível conectar-se ao servidor remoto na porta 8000.
-Causa: Mapeamento de porta incorreto na chamada ou ausência de inicialização do processo.
-Ação Corretiva: O backend analítico server.py utiliza nativamente a porta 8501. Assegure que o Terminal 1 esteja com o Uvicorn ativo e aponte as requisições para http://localhost:8501/api/stats.
-10.5 Consumidor Kafka Retorna Zero Mensagens com Timeout
-Sintoma: Processed a total of 0 messages acompanhado de TimeoutException.
-Causa: Utilização de auto.offset.reset=latest em tópicos cujas mensagens foram propagadas antes do início da escuta do consumidor.
-Ação Corretiva: Realize o consumo direcionado via --partition e atribuição manual do --offset base anotado antes da injeção de dados.
-10.6 Comando Maven Não Reconhecido no Shell
-Sintoma: mvn : O termo 'mvn' não é reconhecido como nome de cmdlet.
-Causa: Ausência de variáveis de ambiente do Apache Maven ou JDK configuradas no hospedeiro.
-Ação Corretiva: Não instale dependências manuais no sistema operacional hospedeiro. Utilize estritamente o contêiner efêmero de compilação fornecido no Passo 3 (docker run ... maven:3.9-eclipse-temurin-17).
+- **Captura pelo log, e não por consultas.** O CDC via WAL evita sobrecarregar o banco operacional e preserva o sistema legado sem alterações.
+- **Um tópico por município.** A origem de cada município fica isolada, e o processamento consome todos por expressão regular.
+- **Dois tempos distintos.** O tempo do evento (`dt_notificacao`) governa a janela de 24 horas. O `source.ts_ms` do Debezium serve apenas para medir a latência, porque `dt_notificacao` é um `TIMESTAMP` sem fuso horário e pode ser interpretado de forma ambígua.
+- **Estado por chave, e não por janela.** A `KeyedProcessFunction` evita a multiplicação de estado das janelas deslizantes nativas e atualiza a contagem a cada evento.
+- **Entrega *at-least-once*.** O tópico de saída pode receber duplicatas após recuperações de falha. Como as contagens são acumuladas, o consumidor as descarta ignorando valores que não superam o anterior.
+- **Ambiente efêmero.** Os containers não usam volumes persistentes: ao recriar o ambiente, os dados, os tópicos e os conectores são recriados, e a etapa de registro dos conectores faz parte da inicialização.
+- **Execução em host único.** Os serviços executam como containers de uma mesma máquina. A medição reflete o desempenho do pipeline, sem efeitos de uma rede de longa distância entre as camadas.
